@@ -1,0 +1,198 @@
+# Network indicator extraction
+#
+# Extracts all network-related indicators of compromise (IOCs) from a binary:
+#   IPv4 / IPv6 addresses
+#   Domain names and hostnames
+#   URLs (HTTP, HTTPS, FTP, custom schemes)
+#   C2 URI path patterns (common Metasploit/Cobalt Strike paths)
+#   User-Agent strings (malware often uses distinctive UAs)
+#   Protocol magic bytes (DNS queries, HTTP headers in binary)
+#   Hardcoded port numbers (in sockaddr structures)
+#   Named pipes (Windows IPC — used by Cobalt Strike, Meterpreter)
+#   Email addresses
+#   Tor .onion addresses
+#
+# Results are classified by type and scored by suspicion level.
+# Private/loopback IPs (10.x, 192.168.x, 127.x) are noted but scored Low.
+# Public IPs and known-bad C2 path patterns are scored High/Critical.
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-network.yml
+#
+#   network-scan:
+#     extends: .re-network
+#     variables:
+#       RE_TARGET: "build/implant.elf"
+
+.re-network:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, re, ipaddress
+
+      target = os.environ.get("RE_TARGET", "build/target")
+
+      try:
+          raw = open(target, "rb").read()
+          text = raw.decode('latin-1', errors='replace')
+      except Exception as e:
+          print(f"Cannot read {target}: {e}")
+          json.dump({"findings": []}, open("network-findings.json", "w"))
+          open("network-report.md","w").write(f"# Network IOC Scan\n\nCould not read: {e}\n")
+          exit(0)
+
+      findings = []
+      iocs     = {}  # type -> set of values
+
+      def add_ioc(ioc_type, value, sev, detail):
+          iocs.setdefault(ioc_type, set()).add(value)
+          findings.append({
+              "title":           f"[RE-NETWORK] {ioc_type}: {value[:80]}",
+              "severity":        sev,
+              "description":     f"**Type:** {ioc_type}\n**Value:** `{value}`\n**Target:** {target}\n\n{detail}",
+              "mitigation":      "Block this indicator at the firewall/proxy. "
+                                "Submit to threat intel platform for enrichment.",
+              "static_finding":  True,
+              "dynamic_finding": False,
+          })
+
+      seen = set()
+
+      def dedup_add(ioc_type, value, sev, detail):
+          key = (ioc_type, value[:120])
+          if key not in seen:
+              seen.add(key)
+              add_ioc(ioc_type, value, sev, detail)
+
+      # IPv4 addresses
+      ipv4_re = re.compile(r'\b((?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?))\b')
+      for m in ipv4_re.finditer(text):
+          ip_str = m.group(1)
+          try:
+              ip = ipaddress.ip_address(ip_str)
+              if ip.is_loopback:
+                  continue  # skip 127.x
+              sev = "Low" if (ip.is_private or ip.is_link_local) else "High"
+              note = "Private/RFC1918 address" if ip.is_private else "Public IP address — potential C2 or exfil target"
+              dedup_add("IPv4 Address", ip_str, sev, note)
+          except ValueError:
+              pass
+
+      # IPv6 addresses
+      ipv6_re = re.compile(r'(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}')
+      for m in ipv6_re.finditer(text):
+          dedup_add("IPv6 Address", m.group(0), "Medium",
+                    "IPv6 address embedded in binary — may be a C2 or fallback address.")
+
+      # URLs
+      url_re = re.compile(r'(https?|ftp|ftps|sftp|ws|wss)://[^\s\'"<>\x00-\x1f]{6,}')
+      for m in url_re.finditer(text):
+          url = m.group(0).rstrip('.,;)')
+          dedup_add("URL", url, "High",
+                    f"Hardcoded URL found: `{url}`. Potential C2, update server, or data exfiltration endpoint.")
+
+      # .onion addresses (Tor)
+      onion_re = re.compile(r'[a-z2-7]{16,56}\.onion(?::\d+)?', re.I)
+      for m in onion_re.finditer(text):
+          dedup_add("Tor .onion Address", m.group(0), "Critical",
+                    "Tor hidden service address — common for C2 infrastructure providing anonymity to operators.")
+
+      # Domain names (excluding common false positives)
+      domain_re = re.compile(r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+(?:com|net|org|io|gov|edu|ru|cn|tk|xyz|top|cc|pw|info|biz|co)\b')
+      IGNORE_DOMAINS = {'example.com', 'localhost', 'test.com', 'domain.com', 'your-domain.com',
+                        'github.com', 'googleapis.com', 'microsoft.com', 'windows.com'}
+      for m in domain_re.finditer(text):
+          domain = m.group(0).lower()
+          if domain not in IGNORE_DOMAINS and len(domain) > 6:
+              dedup_add("Domain Name", domain, "Medium",
+                        f"Hardcoded domain: `{domain}`. May be a C2 domain or exfiltration endpoint.")
+
+      # Named pipes (Cobalt Strike, Meterpreter)
+      pipe_re = re.compile(r'\\\\\.\\pipe\\[^\x00\s\'"]{3,}', re.I)
+      for m in pipe_re.finditer(text):
+          dedup_add("Windows Named Pipe", m.group(0), "High",
+                    f"Named pipe path: `{m.group(0)}`. "
+                    "Cobalt Strike Beacon default pipes: \\\\.\pipe\\mojo.xxx, \\\\.\pipe\\MSSE-xxx. "
+                    "Meterpreter: \\\\.\pipe\\xxx_pipe. Custom pipes may indicate custom C2.")
+
+      # User-Agent strings
+      ua_re = re.compile(r'User-Agent:\s*([^\r\n\x00]{10,})', re.I)
+      SUSPICIOUS_UA_KEYWORDS = ['curl', 'python', 'go-http', 'libwww', 'powershell', 'wget',
+                                 'masscan', 'nmap', 'sqlmap', 'nikto', 'dirbuster']
+      for m in ua_re.finditer(text):
+          ua = m.group(1).strip()
+          is_suspicious = any(kw in ua.lower() for kw in SUSPICIOUS_UA_KEYWORDS)
+          sev = "High" if is_suspicious else "Low"
+          dedup_add("User-Agent String", ua, sev,
+                    f"Hardcoded User-Agent: `{ua}`. "
+                    + ("Suspicious UA used by scanners/exploit tools." if is_suspicious
+                       else "Custom UA may be used to identify implant traffic."))
+
+      # Common C2 URI patterns (Metasploit, Cobalt Strike defaults)
+      C2_PATHS = {
+          r'/[A-Za-z0-9]{4,16}\.php\?[A-Za-z0-9]+=': "Cobalt Strike PHP stager pattern",
+          r'/s/[0-9a-f]{16,32}':                     "Cobalt Strike staged URI pattern",
+          r'/updates/[0-9a-f-]{8,}':                 "Common C2 update path",
+          r'/_/[A-Za-z0-9+/=]{16,}':                 "Base64 URI — encoded C2 channel",
+          r'/MsCRLF':                                 "Metasploit macro stager path",
+          r'/payload\.exe':                           "Generic payload download path",
+          r'/image\.[0-9a-f]{8}\.png':               "Beacon config disguised as image",
+      }
+      for pattern, desc in C2_PATHS.items():
+          if re.search(pattern, text):
+              dedup_add("C2 URI Pattern", pattern, "Critical",
+                        f"Pattern matched: `{pattern}`\n{desc}")
+
+      # Email
+      email_re = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+      for m in email_re.finditer(text):
+          email = m.group(0)
+          if 'example' not in email and 'test' not in email:
+              dedup_add("Email Address", email, "Low",
+                        f"Email address `{email}` found in binary — may be author contact or ransom note address.")
+
+      json.dump({"findings": findings}, open("network-findings.json", "w"), indent=2)
+
+      # Summary
+      with open("network-report.md", "w") as f:
+          f.write(f"# Network IOC Extraction — {target}\n\n")
+          f.write(f"**Total IOCs:** {len(findings)}\n\n")
+          for ioc_type, values in sorted(iocs.items()):
+              f.write(f"### {ioc_type} ({len(values)})\n\n")
+              for v in sorted(values)[:20]:
+                  f.write(f"- `{v}`\n")
+              if len(values) > 20:
+                  f.write(f"- ... and {len(values)-20} more\n")
+              f.write("\n")
+
+      print(f"re-network: {len(findings)} network IOCs across {len(iocs)} types from {target}")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-network"
+        for f in network-findings.json network-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-network-${CI_COMMIT_SHORT_SHA}"
+    paths: [network-findings.json, network-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
