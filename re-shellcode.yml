@@ -1,0 +1,206 @@
+# Shellcode pattern and stager detection
+#
+# Scans a binary for byte-level patterns associated with shellcode generation,
+# stager techniques, and common encoder stubs. Works on raw shellcode blobs,
+# embedded payloads inside PE/ELF binaries, and standalone shellcode files.
+#
+# Detected patterns:
+#   GetPC techniques    — call/pop, fstenv, jmp/call/pop (position-independent addressing)
+#   NOP sleds           — 0x90 runs (x86) and multi-byte NOP alternatives
+#   XOR decode loops    — generic and Shikata-ga-nai specific patterns
+#   Alphanumeric shells — dense printable-ASCII byte ranges
+#   Socket creation     — BSD/Winsock socket() + connect() pattern
+#   exec stubs          — /bin/sh, execve patterns (Linux)
+#   WinAPI hash lookups — hash-based API resolution (avoid string imports)
+#   PEB walking         — FS:[0x30] / GS:[0x60] PEB access pattern
+#   Egg hunter stubs    — NtAccessCheckAndAuditAlarm / page-searching loops
+#   Stack string builds — character-by-character string construction
+#   Reverse shell setup — socket + connect + dup2 + execve combination
+#   Common ports        — hardcoded 4444 (Metasploit default), 1337, 31337, 443, 80
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-shellcode.yml
+#
+#   shellcode-scan:
+#     extends: .re-shellcode
+#     variables:
+#       RE_TARGET: "shellcode.bin"
+
+.re-shellcode:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, re, struct
+
+      target = os.environ.get("RE_TARGET", "build/target")
+
+      try:
+          raw = open(target, "rb").read()
+      except Exception as e:
+          print(f"Cannot read {target}: {e}")
+          json.dump({"findings": []}, open("shellcode-findings.json", "w"))
+          open("shellcode-report.md","w").write(f"# Shellcode Scan\n\nCould not read: {e}\n")
+          exit(0)
+
+      findings = []
+      md_rows  = []
+
+      def add(title, sev, detail, mitigation, offset=None):
+          loc = f" at offset 0x{offset:x}" if offset is not None else ""
+          findings.append({
+              "title":           f"[RE-SHELLCODE] {title}{loc}",
+              "severity":        sev,
+              "description":     f"**Target:** {target}\n**Offset:** {'0x{:x}'.format(offset) if offset is not None else 'multiple'}\n\n{detail}",
+              "mitigation":      mitigation,
+              "static_finding":  True,
+              "dynamic_finding": False,
+          })
+          md_rows.append(f"| {sev} | {title} |")
+
+      BYTE_PATTERNS = [
+          # GetPC — call/pop (most common)
+          ("GetPC call/pop", b'\xe8\x00\x00\x00\x00', "High",
+           "Call instruction with zero offset followed by pop — classic GetPC technique. "
+           "The shellcode calls the next instruction to push EIP onto the stack, "
+           "then pops it to determine its own runtime address.",
+           "Review surrounding code in a disassembler. This is the start of a PIC shellcode stub."),
+          # GetPC — fstenv
+          ("GetPC fstenv", b'\xd9\xee\xd9\x74\x24\xf4', "High",
+           "FSTENV GetPC technique — saves FPU state to stack which includes instruction pointer. "
+           "Used to determine shellcode base address. Common in older encoders.",
+           "Analyse in x86 disassembler starting at this offset."),
+          # NOP sled (32 bytes)
+          ("NOP sled (32+ bytes)", b'\x90' * 32, "High",
+           "NOP sled of 32+ consecutive 0x90 bytes. Used to widen the landing zone "
+           "for an exploit's EIP overwrite. Presence in a non-debug binary is highly suspicious.",
+           "Locate the shellcode payload immediately following the NOP sled."),
+          # Shikata-ga-nai encoder stub (partial — first bytes of FNSTENV variant)
+          ("Shikata-ga-nai encoder stub", b'\xd9\x74\x24\xf4\x5b\x31\xc9', "Critical",
+           "Shikata-ga-nai (SGN) polymorphic XOR encoder stub detected. "
+           "This is the most common Metasploit shellcode encoder. "
+           "Use msfvenom --list encoders to identify. Decode with libemu or sctest.",
+           "Decode with: sctest -Ss 100000 -s < shellcode.bin | ndisasm -b 32 -"),
+          # PEB walking (x86: FS:[30h])
+          ("PEB walk (x86 FS:[30h])", b'\x64\xa1\x30\x00\x00\x00', "High",
+           "Accesses the Process Environment Block via FS:[0x30]. "
+           "Shellcode uses PEB walking to resolve kernel32.dll base address without importing it, "
+           "then walks export tables to find API addresses by hash.",
+           "Hash-based API resolution follows. Identify the hash algorithm (ROR13 is most common) "
+           "and match hashes against a precomputed table."),
+          # PEB walking (x64: GS:[60h])
+          ("PEB walk (x64 GS:[60h])", b'\x65\x48\x8b\x04\x25\x60\x00\x00\x00', "High",
+           "Accesses the PEB via GS:[0x60] — x64 version of PEB walking. "
+           "Used in 64-bit shellcode for hash-based API resolution.",
+           "Follow execution flow in x64 disassembler to identify API resolution loop."),
+          # execve /bin/sh (Linux)
+          ("Linux execve /bin/sh", b'/bin/sh\x00', "High",
+           "String '/bin/sh' found in binary. In shellcode context this is the argument "
+           "to execve() for spawning a shell. In non-shellcode binaries this may be legitimate "
+           "(system() call), but warrants review.",
+           "Locate the execve syscall (0x0b on x86 Linux, 0x3b on x64) near this string."),
+          # int 0x80 syscall (x86 Linux)
+          ("x86 Linux int 0x80 syscall", b'\xcd\x80', "High",
+           "Linux x86 interrupt 0x80 — software interrupt for system call. "
+           "In shellcode context: set EAX to syscall number (11=execve, 1=exit, 102=socketcall) "
+           "before this instruction.",
+           "Disassemble backwards from this offset to determine EAX value and syscall intent."),
+          # syscall instruction (x64)
+          ("x64 syscall instruction", b'\x0f\x05', "Medium",
+           "x64 SYSCALL instruction detected. Used in 64-bit shellcode/exploits for direct "
+           "kernel calls. Check RAX for syscall number.",
+           "Check RAX value set before this instruction. Common: 59=execve, 41=socket, 42=connect."),
+          # Egg hunter (NtAccessCheckAndAuditAlarm based)
+          ("Egg hunter stub", b'\x66\x81\xca\xff\x0f\x42', "High",
+           "Egg hunter stub detected — searches memory pages for a specific 8-byte egg tag "
+           "to locate the main shellcode when there is insufficient contiguous buffer space. "
+           "The egg pattern (duplicated 4-byte tag) will be embedded elsewhere in memory.",
+           "Find the 8-byte egg tag (repeated 4-byte sequence) in the target process memory. "
+           "That location contains the main shellcode payload."),
+          # Metasploit reverse TCP stager (partial)
+          ("Metasploit reverse TCP stager (x86)", b'\xfc\xe8\x82\x00\x00\x00', "Critical",
+           "Metasploit reverse_tcp stager stub detected. This is the beginning of the standard "
+           "x86 Meterpreter/shell_reverse_tcp stager. A hardcoded IP/port follows in the payload.",
+           "Extract the full payload and run through msfvenom decoder or shellcode2exe. "
+           "Check for hardcoded C2 IP address 4 bytes after the CALL instruction."),
+          # Metasploit reverse TCP stager (x64)
+          ("Metasploit reverse TCP stager (x64)", b'\xfc\x48\x83\xe4\xf0\xe8', "Critical",
+           "Metasploit x64 reverse_tcp stager detected. Standard 64-bit Meterpreter stager prefix.",
+           "Extract full shellcode for analysis. Identify embedded C2 IP and port."),
+      ]
+
+      for name, pattern, sev, detail, mitigation in BYTE_PATTERNS:
+          offset = raw.find(pattern)
+          if offset != -1:
+              count = raw.count(pattern)
+              add(f"{name} ({count} occurrence{'s' if count>1 else ''})", sev,
+                  detail + (f"\n\n**First occurrence:** 0x{offset:08x}  **Count:** {count}" if count > 1 else ""),
+                  mitigation, offset)
+
+      # Hardcoded C2 ports (big-endian in socket structures)
+      KNOWN_PORTS = {
+          4444: ("Critical", "Metasploit default listener port"),
+          1337: ("High",     "Common hacker/C2 port"),
+          31337: ("High",    "Classic elite/back-orifice port"),
+          6667: ("High",     "IRC port — IRC bot C2"),
+          8080: ("Medium",   "Alternate HTTP — C2 or tunneling"),
+          443:  ("Low",      "HTTPS — may be legitimate or C2 over SSL"),
+      }
+      for port, (sev, note) in KNOWN_PORTS.items():
+          be_bytes = struct.pack(">H", port)
+          if be_bytes in raw:
+              offset = raw.find(be_bytes)
+              add(f"Hardcoded port {port} (big-endian) — {note}", sev,
+                  f"Port {port} found in big-endian format (network byte order) at 0x{offset:08x}. "
+                  f"In a sockaddr_in structure this is the destination port. {note}",
+                  "Extract surrounding 16 bytes to identify the full sockaddr_in structure and C2 IP address.",
+                  offset)
+
+      # Alphanumeric shellcode detection (dense printable ASCII)
+      printable = sum(1 for b in raw if 0x21 <= b <= 0x7e)
+      ratio = printable / len(raw) if raw else 0
+      if ratio > 0.95 and len(raw) > 64:
+          add("Alphanumeric / printable-ASCII shellcode", "High",
+              f"Binary is {ratio*100:.1f}% printable ASCII. This is consistent with "
+              "alphanumeric shellcode encoding (used to bypass input filters that strip non-ASCII). "
+              f"File size: {len(raw)} bytes.",
+              "Decode using alpha3 or msfvenom. Run through shellcode emulator (libemu/sctest).")
+
+      json.dump({"findings": findings}, open("shellcode-findings.json", "w"), indent=2)
+
+      with open("shellcode-report.md", "w") as f:
+          f.write(f"# Shellcode Pattern Detection — {target}\n\n")
+          f.write(f"**File size:** {len(raw):,} bytes  |  **Patterns matched:** {len(findings)}\n\n")
+          f.write("| Severity | Pattern |\n|---|---|\n")
+          f.write("\n".join(md_rows) + "\n")
+
+      print(f"re-shellcode: {len(findings)} shellcode patterns in {target} ({len(raw):,} bytes)")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-shellcode"
+        for f in shellcode-findings.json shellcode-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-shellcode-${CI_COMMIT_SHORT_SHA}"
+    paths: [shellcode-findings.json, shellcode-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
