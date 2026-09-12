@@ -1,0 +1,187 @@
+# String extraction and pattern matching
+#
+# Extracts printable strings from a binary and runs regex patterns to find:
+#   - Hardcoded credentials (passwords, API keys, tokens)
+#   - URLs and HTTP endpoints
+#   - IP addresses (IPv4 and IPv6)
+#   - File system paths (Unix and Windows)
+#   - Windows registry keys
+#   - Base64-encoded blobs (potential encoded payloads)
+#   - JWT tokens
+#   - Email addresses
+#   - UNC paths (\\server\share)
+#   - Interesting command strings (shell commands, PowerShell, cmd.exe)
+#   - Debug/developer artefacts (TODO, FIXME, debug flags, test credentials)
+#
+# Each matched string becomes a DefectDojo finding with the pattern category
+# as the title and the matched value in the description.
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-strings.yml
+#
+#   strings-scan:
+#     extends: .re-strings
+#     variables:
+#       RE_TARGET: "build/malware.elf"
+#       RE_MIN_STRING_LEN: "8"
+#
+# Output:
+#   strings-raw.txt        — all extracted strings (one per line)
+#   strings-findings.json  — categorised DefectDojo findings
+#   strings-report.md      — Markdown table of interesting strings
+
+.re-strings:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    RE_MIN_STRING_LEN: "6"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq binutils file 2>/dev/null
+  script:
+    - |
+      echo "=== String Extraction: ${RE_TARGET} ==="
+      file "${RE_TARGET}" || echo "file: command failed"
+      strings -n "${RE_MIN_STRING_LEN}" "${RE_TARGET}" > strings-raw.txt 2>/dev/null || true
+      TOTAL=$(wc -l < strings-raw.txt)
+      echo "Extracted ${TOTAL} strings (min length=${RE_MIN_STRING_LEN})"
+
+    - |
+      python3 << 'PYEOF'
+      import re, json, os
+
+      target = os.environ.get("RE_TARGET", "build/target")
+      strings_file = "strings-raw.txt"
+
+      try:
+          lines = open(strings_file).read().splitlines()
+      except FileNotFoundError:
+          lines = []
+          print("No strings file — binary may not exist or strings extraction failed.")
+
+      PATTERNS = {
+          "Hardcoded Password": [
+              (re.compile(r'(?i)(password|passwd|pwd|secret|pass)\s*[=:]\s*\S+'), "High"),
+              (re.compile(r'(?i)(api[_-]?key|apikey|access[_-]?key|auth[_-]?token)\s*[=:]\s*\S{8,}'), "High"),
+          ],
+          "JWT Token": [
+              (re.compile(r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'), "High"),
+          ],
+          "Base64 Encoded Blob": [
+              (re.compile(r'(?:[A-Za-z0-9+/]{40,}={0,2})'), "Medium"),
+          ],
+          "URL / HTTP Endpoint": [
+              (re.compile(r'https?://[^\s\'"<>]{8,}'), "Medium"),
+              (re.compile(r'ftp://[^\s\'"<>]{6,}'), "Medium"),
+          ],
+          "IPv4 Address": [
+              (re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'), "Low"),
+          ],
+          "IPv6 Address": [
+              (re.compile(r'(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}'), "Low"),
+          ],
+          "Windows Registry Key": [
+              (re.compile(r'(?i)HKEY_(LOCAL_MACHINE|CURRENT_USER|CLASSES_ROOT|USERS|CURRENT_CONFIG)[\\\/]\S+'), "Medium"),
+          ],
+          "Windows File Path": [
+              (re.compile(r'[A-Za-z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*'), "Low"),
+          ],
+          "Unix File Path": [
+              (re.compile(r'(?:/(?:etc|tmp|home|usr|var|proc|dev|bin|sbin|opt|root)(?:/[^\s\'"]+)+)'), "Low"),
+          ],
+          "UNC Network Path": [
+              (re.compile(r'\\\\[A-Za-z0-9._-]+\\[A-Za-z0-9._$-]+'), "Medium"),
+          ],
+          "Email Address": [
+              (re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'), "Low"),
+          ],
+          "Shell / PowerShell Command": [
+              (re.compile(r'(?i)(powershell|cmd\.exe|/bin/sh|/bin/bash|bash -[ci]|sh -[ci])\s+\S+'), "High"),
+              (re.compile(r'(?i)(wget|curl|nc|ncat|netcat)\s+\S+'), "High"),
+              (re.compile(r'(?i)(chmod\s+[0-7]{3,4}|chown\s+\S+|useradd\s+\S+)'), "Medium"),
+          ],
+          "Debug / Test Artifact": [
+              (re.compile(r'(?i)(TODO|FIXME|HACK|BACKDOOR|test[-_]?(pass|cred|key|secret)|debug[-_]?mode)'), "Low"),
+          ],
+          "Private Key Header": [
+              (re.compile(r'-----BEGIN (RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----'), "Critical"),
+          ],
+          "AWS / Cloud Credential": [
+              (re.compile(r'AKIA[0-9A-Z]{16}'), "Critical"),
+              (re.compile(r'(?i)(aws[_-]?secret[_-]?access[_-]?key)\s*[=:]\s*\S{20,}'), "Critical"),
+          ],
+          "Connection String": [
+              (re.compile(r'(?i)(jdbc|mongodb|redis|postgresql|mysql|mssql|oracle)://[^\s\'"]{10,}'), "High"),
+              (re.compile(r'(?i)Data\s*Source\s*=\s*[^;]+;.*Password\s*=[^\s;]+'), "High"),
+          ],
+      }
+
+      findings = []
+      md_rows  = []
+      seen     = set()
+
+      for line in lines:
+          line = line.strip()
+          if not line:
+              continue
+          for category, pattern_list in PATTERNS.items():
+              for pattern, severity in pattern_list:
+                  m = pattern.search(line)
+                  if m:
+                      matched = m.group(0)
+                      key = (category, matched[:80])
+                      if key in seen:
+                          continue
+                      seen.add(key)
+
+                      findings.append({
+                          "title":           f"[RE-STRINGS] {category}: {matched[:60]}",
+                          "severity":        severity,
+                          "description":     (
+                              f"**Category:** {category}\n"
+                              f"**Target:** {target}\n"
+                              f"**Matched value:** `{matched}`\n"
+                              f"**Source string:** `{line[:200]}`"
+                          ),
+                          "mitigation":      "Review whether this string is intentional. "
+                                            "Hardcoded credentials, keys, and tokens must be removed and rotated.",
+                          "static_finding":  True,
+                          "dynamic_finding": False,
+                      })
+                      md_rows.append(f"| {severity} | {category} | `{matched[:60]}` |")
+
+      json.dump({"findings": findings}, open("strings-findings.json", "w"), indent=2)
+
+      with open("strings-report.md", "w") as f:
+          f.write(f"# String Pattern Scan — {target}\n\n")
+          f.write(f"**Total strings extracted:** {len(lines)}  |  **Interesting matches:** {len(findings)}\n\n")
+          f.write("| Severity | Category | Match |\n|---|---|---|\n")
+          f.write("\n".join(md_rows) + "\n")
+
+      print(f"re-strings: {len(findings)} interesting strings found in {len(lines)} total")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-strings"
+        for f in strings-raw.txt strings-findings.json strings-report.md; do
+          [ -f "$f" ] && curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-strings-${CI_COMMIT_SHORT_SHA}"
+    paths: [strings-raw.txt, strings-findings.json, strings-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
