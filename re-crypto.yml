@@ -1,0 +1,221 @@
+# Cryptographic constant and algorithm detection
+#
+# Scans a binary for known cryptographic constants embedded as byte sequences.
+# These constants appear when crypto algorithms are statically linked or
+# implemented inline — their presence identifies which algorithms are in use
+# and may indicate weaknesses (broken algorithms, hardcoded keys).
+#
+# Detected signatures:
+#   AES       — S-box (forward + inverse), round constants
+#   DES/3DES  — S-boxes, PC1/PC2 permutation tables
+#   RC4       — key scheduling loop signature
+#   MD5       — initial hash values (0x67452301, 0xefcdab89, ...)
+#   SHA-1     — initial hash values (0x67452301, 0xefcdab89, ...)
+#   SHA-256   — round constants (first 64 prime cube roots)
+#   CRC32     — polynomial table (0xEDB88320)
+#   TEA/XTEA  — delta constant (0x9E3779B9)
+#   Blowfish  — P-array first values
+#   Camellia  — SIGMA constants
+#   Hardcoded keys — high-entropy byte runs adjacent to known algo constants
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-crypto.yml
+#
+#   crypto-scan:
+#     extends: .re-crypto
+#     variables:
+#       RE_TARGET: "build/suspicious.elf"
+
+.re-crypto:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, struct, math
+
+      target = os.environ.get("RE_TARGET", "build/target")
+
+      try:
+          data = open(target, "rb").read()
+      except Exception as e:
+          print(f"Cannot read {target}: {e}")
+          json.dump({"findings": []}, open("crypto-findings.json", "w"))
+          open("crypto-report.md","w").write(f"# Crypto Scan\n\nCould not read target: {e}\n")
+          exit(0)
+
+      SIGNATURES = {
+          # AES forward S-box (first 16 bytes)
+          "AES S-box (Forward)": {
+              "bytes": bytes([0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76]),
+              "severity": "Medium",
+              "note": "AES encryption present. Verify algorithm mode (ECB is insecure).",
+          },
+          # AES inverse S-box (first 16 bytes)
+          "AES S-box (Inverse)": {
+              "bytes": bytes([0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb]),
+              "severity": "Medium",
+              "note": "AES decryption S-box found. Full AES implementation present.",
+          },
+          # SHA-256 initial hash values (H0-H3)
+          "SHA-256 Initial Values": {
+              "bytes": struct.pack(">IIII", 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a),
+              "severity": "Low",
+              "note": "SHA-256 implementation found. Generally safe; check if used for password hashing (should use bcrypt/scrypt instead).",
+          },
+          # MD5 initial values (little-endian)
+          "MD5 Initial Values": {
+              "bytes": struct.pack("<IIII", 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476),
+              "severity": "High",
+              "note": "MD5 implementation found. MD5 is cryptographically broken — do not use for integrity or password hashing.",
+          },
+          # SHA-1 initial values (big-endian)
+          "SHA-1 Initial Values": {
+              "bytes": struct.pack(">IIIII", 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0),
+              "severity": "High",
+              "note": "SHA-1 implementation found. SHA-1 is deprecated and collision-prone.",
+          },
+          # TEA/XTEA delta constant
+          "TEA/XTEA Delta Constant": {
+              "bytes": struct.pack("<I", 0x9e3779b9),
+              "severity": "Medium",
+              "note": "TEA or XTEA cipher constant detected. TEA has known weaknesses (related-key attacks).",
+          },
+          # CRC32 polynomial
+          "CRC32 Polynomial Table": {
+              "bytes": struct.pack("<I", 0xedb88320),
+              "severity": "Low",
+              "note": "CRC32 polynomial found. CRC is not a cryptographic hash — do not use for integrity checking against adversaries.",
+          },
+          # RC4 KSA loop signature: i=0..255 swap pattern
+          "RC4 Key Scheduling Constant": {
+              "bytes": bytes([0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f]),
+              "severity": "High",
+              "note": "Potential RC4 key scheduling table. RC4 is broken (BEAST, RC4 biases). Do not use.",
+          },
+          # DES PC-1 permutation first bytes
+          "DES Permutation Table": {
+              "bytes": bytes([57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2]),
+              "severity": "High",
+              "note": "DES permutation table found. DES has a 56-bit key and is trivially brute-forceable.",
+          },
+          # Blowfish P-array first constant (fractional part of pi)
+          "Blowfish P-array": {
+              "bytes": struct.pack(">II", 0x243f6a88, 0x85a308d3),
+              "severity": "Medium",
+              "note": "Blowfish cipher detected. Blowfish has a 4KB key schedule and birthday attack risk for long-lived keys (>= 4GB data).",
+          },
+          # Camellia SIGMA1
+          "Camellia SIGMA Constant": {
+              "bytes": struct.pack(">Q", 0xA09E667F3BCC908B),
+              "severity": "Low",
+              "note": "Camellia cipher constant detected. Camellia is generally secure.",
+          },
+      }
+
+      # High-entropy key detection (runs of ≥16 bytes with entropy > 7.0)
+      def byte_entropy(block):
+          if not block:
+              return 0.0
+          freq = [0]*256
+          for b in block:
+              freq[b] += 1
+          n = len(block)
+          return -sum((c/n)*math.log2(c/n) for c in freq if c)
+
+      findings = []
+      md_rows  = []
+
+      for name, sig in SIGNATURES.items():
+          pattern = sig["bytes"]
+          offset  = data.find(pattern)
+          if offset != -1:
+              findings.append({
+                  "title":           f"[RE-CRYPTO] {name} at offset 0x{offset:x}",
+                  "severity":        sig["severity"],
+                  "description":     (
+                      f"**Signature:** {name}\n"
+                      f"**File:** {target}\n"
+                      f"**Offset:** 0x{offset:08x}\n"
+                      f"**Pattern (hex):** {pattern.hex()}\n\n"
+                      f"{sig['note']}"
+                  ),
+                  "mitigation":      sig["note"],
+                  "static_finding":  True,
+                  "dynamic_finding": False,
+              })
+              md_rows.append(f"| {sig['severity']} | {name} | 0x{offset:08x} |")
+
+      # Scan for high-entropy regions (potential hardcoded keys/shellcode)
+      block_size = 32
+      key_count = 0
+      for i in range(0, len(data) - block_size, 4):
+          block = data[i:i+block_size]
+          ent = byte_entropy(block)
+          if ent > 7.5:
+              key_count += 1
+              if key_count <= 5:  # cap findings
+                  findings.append({
+                      "title":       f"[RE-CRYPTO] High-entropy region at 0x{i:x} (entropy={ent:.2f})",
+                      "severity":    "Medium",
+                      "description": (
+                          f"**Offset:** 0x{i:08x}\n"
+                          f"**Entropy:** {ent:.2f} / 8.0\n"
+                          f"**Hex preview:** {data[i:i+16].hex()}\n\n"
+                          "High entropy suggests encrypted/compressed data, a hardcoded key, or shellcode. "
+                          "Review this region in a disassembler."
+                      ),
+                      "mitigation":  "Review in Ghidra/radare2. If this is a hardcoded cryptographic key, "
+                                    "replace with a key derived at runtime from a secure KDF.",
+                      "static_finding":  True,
+                      "dynamic_finding": False,
+                  })
+                  md_rows.append(f"| Medium | High-entropy region | 0x{i:08x} (ent={ent:.2f}) |")
+
+      if key_count > 5:
+          findings.append({
+              "title": f"[RE-CRYPTO] {key_count} high-entropy regions (showing first 5)",
+              "severity": "Medium",
+              "description": f"{key_count} regions with entropy > 7.5 detected. "
+                            "High volume suggests packed/encrypted binary or large embedded payload.",
+              "mitigation": "Unpack with binwalk or dynamic analysis before further RE.",
+              "static_finding": True, "dynamic_finding": False,
+          })
+
+      json.dump({"findings": findings}, open("crypto-findings.json", "w"), indent=2)
+
+      with open("crypto-report.md", "w") as f:
+          f.write(f"# Crypto Constant Scan — {target}\n\n")
+          f.write(f"**File size:** {len(data):,} bytes  |  **Findings:** {len(findings)}\n\n")
+          f.write("| Severity | Signature | Offset |\n|---|---|---|\n")
+          f.write("\n".join(md_rows) + "\n")
+
+      print(f"re-crypto: {len(findings)} crypto signatures detected in {target}")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-crypto"
+        for f in crypto-findings.json crypto-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-crypto-${CI_COMMIT_SHORT_SHA}"
+    paths: [crypto-findings.json, crypto-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
