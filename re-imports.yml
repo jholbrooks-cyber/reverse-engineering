@@ -1,0 +1,246 @@
+# Import / export table analysis
+#
+# Parses the import and export tables of PE (Windows) and ELF (Linux) binaries.
+# Flags dangerous or suspicious imported functions that are commonly abused
+# by malware, exploits, or poorly-written software.
+#
+# PE dangerous import categories:
+#   Process injection   — CreateRemoteThread, WriteProcessMemory, VirtualAllocEx,
+#                         NtCreateThreadEx, RtlCreateUserThread
+#   Code execution      — WinExec, ShellExecute*, CreateProcess*
+#   Privilege escalation— AdjustTokenPrivileges, ImpersonateLoggedOnUser
+#   Anti-analysis       — IsDebuggerPresent, CheckRemoteDebuggerPresent, NtQueryInformationProcess
+#   Credential access   — CryptAcquireContext, LsaOpenPolicy, SamConnect
+#   Network             — WSAStartup, connect, send, recv, InternetOpenA, HttpSendRequest
+#   Rootkit             — ZwSetSystemInformation, NtLoadDriver
+#   Hooking             — SetWindowsHookEx, GetAsyncKeyState (keylogger)
+#   Reflective loading  — LoadLibraryA + GetProcAddress combo
+#
+# ELF dangerous import categories:
+#   Memory manipulation — mprotect, mmap with PROT_EXEC
+#   Code injection      — ptrace, process_vm_writev
+#   Privilege           — setuid, setgid, capset
+#   Anti-analysis       — prctl(PR_SET_DUMPABLE)
+#   Shell execution     — execve, system, popen
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-imports.yml
+#
+#   imports-scan:
+#     extends: .re-imports
+#     variables:
+#       RE_TARGET: "build/suspicious.dll"
+
+.re-imports:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - pip install --quiet pefile pyelftools
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os
+
+      target = os.environ.get("RE_TARGET", "build/target")
+
+      PE_DANGEROUS = {
+          # Process injection
+          "CreateRemoteThread":          ("Critical", "Process injection — execute code in remote process"),
+          "CreateRemoteThreadEx":        ("Critical", "Process injection — extended remote thread creation"),
+          "WriteProcessMemory":          ("Critical", "Process injection — write to another process's memory"),
+          "VirtualAllocEx":              ("Critical", "Process injection — allocate memory in remote process"),
+          "NtCreateThreadEx":            ("Critical", "Process injection — NT-level thread creation, bypasses hooks"),
+          "RtlCreateUserThread":         ("Critical", "Process injection — undocumented thread creation"),
+          "QueueUserAPC":                ("High",     "APC injection — queue code into another thread"),
+          # Code execution
+          "WinExec":                     ("High",     "Command execution — runs a child process"),
+          "ShellExecuteA":               ("High",     "Shell execution — opens file or runs command"),
+          "ShellExecuteW":               ("High",     "Shell execution — Unicode variant"),
+          "ShellExecuteExA":             ("High",     "Shell execution — extended variant"),
+          "CreateProcessA":              ("Medium",   "Process creation — spawns new process"),
+          "CreateProcessW":              ("Medium",   "Process creation — Unicode variant"),
+          # Anti-analysis / evasion
+          "IsDebuggerPresent":           ("High",     "Anti-debug — checks if debugger is attached"),
+          "CheckRemoteDebuggerPresent":  ("High",     "Anti-debug — checks for remote debugger"),
+          "NtQueryInformationProcess":   ("High",     "Anti-debug — NT query used for debugger detection"),
+          "OutputDebugStringA":          ("Medium",   "Anti-debug — can crash OllyDbg via format string"),
+          "GetTickCount":                ("Medium",   "Anti-debug — timing check to detect single-stepping"),
+          "QueryPerformanceCounter":     ("Medium",   "Anti-debug — high-res timing for sandbox detection"),
+          # Privilege escalation
+          "AdjustTokenPrivileges":       ("High",     "Privilege escalation — enable disabled privileges"),
+          "ImpersonateLoggedOnUser":     ("High",     "Privilege escalation — impersonate another user token"),
+          "DuplicateTokenEx":            ("High",     "Privilege escalation — clone access token"),
+          "LsaOpenPolicy":               ("High",     "Credential access — open LSA policy database"),
+          "SamConnect":                  ("High",     "Credential access — connect to SAM database"),
+          # Hooking / keylogging
+          "SetWindowsHookExA":           ("High",     "Hooking — install system-wide hook (keylogger, injection)"),
+          "SetWindowsHookExW":           ("High",     "Hooking — Unicode variant"),
+          "GetAsyncKeyState":            ("High",     "Keylogger — poll key state asynchronously"),
+          # Network
+          "WSAStartup":                  ("Low",      "Network — Winsock initialisation"),
+          "InternetOpenA":               ("Medium",   "Network — WinInet HTTP session open"),
+          "HttpSendRequestA":            ("Medium",   "Network — send HTTP request"),
+          "URLDownloadToFileA":          ("High",     "Downloader — download file from URL"),
+          # Memory
+          "VirtualProtect":              ("Medium",   "Memory — change page protections (DEP bypass)"),
+          # Rootkit / driver
+          "NtLoadDriver":                ("Critical", "Driver loading — can load unsigned kernel driver"),
+          "ZwSetSystemInformation":      ("High",     "Rootkit — system-level configuration change"),
+          # Reflective DLL
+          "LoadLibraryA":                ("Low",      "Dynamic loading — combined with GetProcAddress = reflective load"),
+          "GetProcAddress":              ("Low",      "Dynamic loading — resolve export at runtime"),
+      }
+
+      ELF_DANGEROUS = {
+          "ptrace":            ("Critical", "Process tracing / injection — PTRACE_POKETEXT writes to process memory"),
+          "process_vm_writev": ("Critical", "Process injection — write to another process memory without ptrace"),
+          "process_vm_readv":  ("High",     "Process memory read — extract data from another process"),
+          "mprotect":          ("High",     "Memory protection change — mark pages PROT_EXEC (DEP bypass)"),
+          "mmap":              ("Medium",   "Memory mapping — PROT_EXEC mappings enable shellcode execution"),
+          "execve":            ("High",     "Shell execution — replace current process image"),
+          "system":            ("High",     "Command execution — runs shell command"),
+          "popen":             ("High",     "Command execution — open pipe to shell command"),
+          "setuid":            ("High",     "Privilege — set user ID (SUID abuse)"),
+          "setgid":            ("High",     "Privilege — set group ID"),
+          "capset":            ("High",     "Privilege — set process capabilities"),
+          "prctl":             ("Medium",   "Process control — can disable core dumps / set dumpable"),
+          "dlopen":            ("Medium",   "Dynamic loading — load shared library at runtime"),
+          "fopen":             ("Low",      "File I/O — combined with suspicious paths is interesting"),
+      }
+
+      try:
+          raw = open(target, "rb").read()
+      except Exception as e:
+          print(f"Cannot read {target}: {e}")
+          json.dump({"findings": []}, open("imports-findings.json", "w"))
+          open("imports-report.md","w").write(f"# Import Scan\n\nCould not read: {e}\n")
+          exit(0)
+
+      imports = {}
+      exports = []
+      fmt = "unknown"
+
+      if raw[:2] == b'MZ':
+          fmt = "PE"
+          try:
+              import pefile
+              pe = pefile.PE(data=raw)
+              if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                  for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                      dll = entry.dll.decode('ascii','replace')
+                      for imp in entry.imports:
+                          name = imp.name.decode('ascii','replace') if imp.name else f"ord_{imp.ordinal}"
+                          imports.setdefault(dll, []).append(name)
+              if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                  for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                      if exp.name:
+                          exports.append(exp.name.decode('ascii','replace'))
+          except Exception as e:
+              print(f"pefile error: {e}")
+
+      elif raw[:4] == b'\x7fELF':
+          fmt = "ELF"
+          try:
+              from elftools.elf.elffile import ELFFile
+              from elftools.elf.dynamic import DynamicSection
+              from elftools.elf.sections import SymbolTableSection
+              from io import BytesIO
+              elf = ELFFile(BytesIO(raw))
+              for sec in elf.iter_sections():
+                  if isinstance(sec, DynamicSection):
+                      for tag in sec.iter_tags():
+                          if tag.entry.d_tag == 'DT_NEEDED':
+                              imports.setdefault(tag.needed, [])
+                  if isinstance(sec, SymbolTableSection):
+                      for sym in sec.iter_symbols():
+                          if sym.entry.st_shndx == 'SHN_UNDEF' and sym.name:
+                              lib = "unknown"
+                              for k in imports:
+                                  imports[k].append(sym.name)
+                                  lib = k
+                                  break
+                              if not imports:
+                                  imports.setdefault("dynamic", []).append(sym.name)
+                          elif sym.name and sym.entry['st_info']['bind'] == 'STB_GLOBAL':
+                              exports.append(sym.name)
+          except Exception as e:
+              print(f"pyelftools error: {e}")
+
+      DANGEROUS = PE_DANGEROUS if fmt == "PE" else ELF_DANGEROUS
+
+      findings = []
+      md_rows  = []
+      all_imports = [fn for fns in imports.values() for fn in fns]
+
+      # Check for reflective load pattern (PE-specific)
+      if fmt == "PE" and "LoadLibraryA" in all_imports and "GetProcAddress" in all_imports:
+          findings.append({
+              "title": "[RE-IMPORTS] Reflective DLL loading pattern: LoadLibraryA + GetProcAddress",
+              "severity": "High",
+              "description": "Both LoadLibraryA and GetProcAddress are imported. This combination is the "
+                            "foundation of reflective DLL injection — loading a DLL entirely from memory "
+                            "without touching disk. Also commonly used for dynamic API resolution to evade "
+                            "import-table analysis.",
+              "mitigation": "Review all LoadLibrary/GetProcAddress call sites in a disassembler. "
+                           "Determine if the resolved functions are themselves suspicious.",
+              "static_finding": True, "dynamic_finding": False,
+          })
+
+      for dll, funcs in imports.items():
+          for fn in funcs:
+              if fn in DANGEROUS:
+                  sev, note = DANGEROUS[fn]
+                  findings.append({
+                      "title":       f"[RE-IMPORTS] Dangerous import: {fn} (from {dll})",
+                      "severity":    sev,
+                      "description": f"**Function:** `{fn}`\n**DLL/Library:** `{dll}`\n**Format:** {fmt}\n\n{note}",
+                      "mitigation":  f"Review all call sites of `{fn}` in a disassembler. "
+                                    "Determine if the usage is legitimate or malicious.",
+                      "static_finding":  True,
+                      "dynamic_finding": False,
+                  })
+                  md_rows.append(f"| {sev} | `{fn}` | `{dll}` | {note[:60]} |")
+
+      json.dump({"findings": findings}, open("imports-findings.json", "w"), indent=2)
+
+      with open("imports-report.md", "w") as f:
+          f.write(f"# Import / Export Analysis — {target} ({fmt})\n\n")
+          f.write(f"**Total imports:** {len(all_imports)}  |  **Exports:** {len(exports)}  |  "
+                  f"**Dangerous imports:** {len(findings)}\n\n")
+          f.write("| Severity | Function | Library | Note |\n|---|---|---|---|\n")
+          f.write("\n".join(md_rows) + "\n\n")
+          if exports:
+              f.write(f"## Exports ({len(exports)})\n\n")
+              f.write("\n".join(f"- `{e}`" for e in exports[:50]))
+              if len(exports) > 50:
+                  f.write(f"\n... and {len(exports)-50} more")
+
+      print(f"re-imports: {len(findings)} dangerous imports from {len(all_imports)} total ({fmt})")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-imports"
+        for f in imports-findings.json imports-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-imports-${CI_COMMIT_SHORT_SHA}"
+    paths: [imports-findings.json, imports-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
