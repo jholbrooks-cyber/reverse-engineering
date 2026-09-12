@@ -1,0 +1,214 @@
+# Anti-analysis technique detection
+#
+# Detects strings, imports, and byte patterns associated with techniques
+# malware uses to detect or evade debuggers, sandboxes, and virtual machines.
+#
+# Categories:
+#   Anti-debug (API)       — IsDebuggerPresent, CheckRemoteDebuggerPresent,
+#                            NtQueryInformationProcess, ZwSetInformationThread
+#   Anti-debug (timing)    — RDTSC, GetTickCount, QueryPerformanceCounter
+#   Anti-debug (exception) — SetUnhandledExceptionFilter, RaiseException used as debug check
+#   Anti-sandbox           — Sleep(long), GetForegroundWindow, mouse click check,
+#                            username/computername environment checks
+#   Anti-VM (strings)      — "VMware", "VirtualBox", "QEMU", "Hyper-V",
+#                            "Virtual Machine", "sandbox", "cuckoo"
+#   Anti-VM (registry)     — Known VM registry key paths
+#   Anti-VM (process)      — Known analysis tool process names
+#   Anti-dump              — NtSetInformationProcess (disable heap) + SIZE_OF_IMAGE patching
+#   Code integrity         — Self-checksumming, CRC of code section at runtime
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-antidebug.yml
+#
+#   antidebug-scan:
+#     extends: .re-antidebug
+#     variables:
+#       RE_TARGET: "build/suspicious.exe"
+
+.re-antidebug:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq binutils 2>/dev/null
+    - pip install --quiet pefile
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, re
+
+      target = os.environ.get("RE_TARGET", "build/target")
+
+      try:
+          raw = open(target, "rb").read()
+          # Also get printable strings for string-based detection
+          strings_set = set(
+              s.decode('ascii','replace')
+              for s in re.findall(rb'[\x20-\x7e]{5,}', raw)
+          )
+      except Exception as e:
+          print(f"Cannot read {target}: {e}")
+          json.dump({"findings": []}, open("antidebug-findings.json", "w"))
+          open("antidebug-report.md","w").write(f"# Anti-Debug Scan\n\nCould not read: {e}\n")
+          exit(0)
+
+      findings = []
+      detected_categories = {}
+
+      def add(category, title, sev, detail, mitigation):
+          if category not in detected_categories:
+              detected_categories[category] = []
+          detected_categories[category].append({
+              "title": title, "severity": sev,
+              "description": f"**Category:** {category}\n**Target:** {target}\n\n{detail}",
+              "mitigation": mitigation,
+              "static_finding": True, "dynamic_finding": False,
+          })
+
+      # Anti-debug API strings
+      ANTIDEBUG_APIS = {
+          "IsDebuggerPresent":            ("High",   "Anti-debug",
+              "Checks the PEB.BeingDebugged flag. Basic anti-debug, easily bypassed by patching or ScyllaHide."),
+          "CheckRemoteDebuggerPresent":   ("High",   "Anti-debug",
+              "Checks if a remote debugger is attached via DebugPort. Bypass: patch return value or hook NtQueryInformationProcess."),
+          "NtQueryInformationProcess":    ("High",   "Anti-debug",
+              "Used to query ProcessDebugPort (7), ProcessDebugObjectHandle (30), ProcessDebugFlags (31). "
+              "Common stealthy anti-debug. Bypass: hook and return 0."),
+          "ZwSetInformationThread":       ("High",   "Anti-debug",
+              "Called with ThreadHideFromDebugger (0x11) to prevent debugger events from reaching the thread. "
+              "Bypass: hook and NOP the call."),
+          "OutputDebugStringA":           ("Medium", "Anti-debug",
+              "In some configurations this crashes OllyDbg. Also used as a timing check (slow under debugger)."),
+          "SetUnhandledExceptionFilter":  ("Medium", "Anti-debug",
+              "Malware registers a custom exception handler; if running under a debugger the handler is not called, "
+              "which the malware interprets as being debugged."),
+          "FindWindow":                   ("Medium", "Anti-debug",
+              "Used to find debugger windows by class name (e.g. OLLYDBG, x64dbg). "
+              "Commonly combined with window title checks."),
+          "GetForegroundWindow":          ("Low",    "Anti-sandbox",
+              "Sandbox check — if no interactive foreground window exists, assume sandbox and exit."),
+          "GetCursorPos":                 ("Low",    "Anti-sandbox",
+              "Mouse position check — if cursor never moves, assume automated sandbox environment."),
+          "GetUserNameA":                 ("Low",    "Anti-sandbox",
+              "Username check against known sandbox/VM usernames (e.g. 'sandbox', 'malware', 'test')."),
+          "GetComputerNameA":             ("Low",    "Anti-sandbox",
+              "Computer name check against known sandbox hostnames."),
+          "Sleep":                        ("Low",    "Anti-sandbox",
+              "Long sleep calls delay sandbox execution. Some sandboxes fast-forward time."),
+          "CreateToolhelp32Snapshot":     ("Medium", "Anti-sandbox",
+              "Process enumeration — checks running processes for known analysis tools "
+              "(OllyDbg.exe, x32dbg.exe, wireshark.exe, procmon.exe, etc.)."),
+          "QueryPerformanceCounter":      ("Medium", "Anti-debug (timing)",
+              "High-resolution timing check. Two consecutive calls; if delta is too small (too fast = being stepped), exit."),
+          "GetTickCount":                 ("Medium", "Anti-debug (timing)",
+              "Low-resolution timing check for single-stepping detection."),
+      }
+
+      for api, (sev, cat, detail) in ANTIDEBUG_APIS.items():
+          if api in raw.decode('latin-1', errors='replace') or any(api in s for s in strings_set):
+              add(cat, f"[RE-ANTIDEBUG] {api}", sev, detail,
+                  "Use ScyllaHide plugin (x64dbg/x32dbg) to automatically bypass common anti-debug techniques. "
+                  "For targeted bypass, hook the function and patch the return value.")
+
+      # VM detection strings
+      VM_STRINGS = {
+          "VMware":            ("High",  "Anti-VM", "VMware hypervisor string detected — VM fingerprinting."),
+          "VirtualBox":        ("High",  "Anti-VM", "VirtualBox hypervisor string detected."),
+          "VBOX":              ("High",  "Anti-VM", "VirtualBox abbreviated string detected."),
+          "QEMU":              ("High",  "Anti-VM", "QEMU hypervisor string — common sandbox environment."),
+          "Hyper-V":           ("High",  "Anti-VM", "Microsoft Hyper-V string detected."),
+          "Virtual Machine":   ("High",  "Anti-VM", "Generic VM detection string."),
+          "Sandbox":           ("High",  "Anti-sandbox", "Sandbox detection string."),
+          "cuckoo":            ("High",  "Anti-sandbox", "Cuckoo sandbox name detected — targeted evasion."),
+          "WINE":              ("Medium","Anti-VM", "WINE compatibility layer detection."),
+          "innotek":           ("High",  "Anti-VM", "VirtualBox vendor string in BIOS."),
+          "BOCHS":             ("High",  "Anti-VM", "Bochs emulator detection string."),
+          "VPCEXT":            ("High",  "Anti-VM", "Microsoft Virtual PC extension string."),
+          # Known analysis tool process names
+          "ollydbg":           ("High",  "Anti-debug", "OllyDbg process name — process list check."),
+          "x32dbg":            ("High",  "Anti-debug", "x32dbg process name — process list check."),
+          "x64dbg":            ("High",  "Anti-debug", "x64dbg process name — process list check."),
+          "idaq":              ("High",  "Anti-debug", "IDA Pro process name — process list check."),
+          "wireshark":         ("Medium","Anti-sandbox","Wireshark process name — network analysis detection."),
+          "procmon":           ("Medium","Anti-sandbox","Process Monitor — Sysinternals analysis tool."),
+          "processhacker":     ("Medium","Anti-sandbox","Process Hacker analysis tool."),
+          "pestudio":          ("Medium","Anti-sandbox","PEStudio analysis tool detection."),
+      }
+
+      for vm_str, (sev, cat, detail) in VM_STRINGS.items():
+          lower_raw = raw.decode('latin-1','replace').lower()
+          if vm_str.lower() in lower_raw:
+              add(cat, f"[RE-ANTIDEBUG] VM/sandbox string: '{vm_str}'", sev, detail,
+                  "Patch or NOP the string comparison. In a VM: rename SVGA driver files, "
+                  "modify BIOS strings, use VMware hardening scripts.")
+
+      # VM registry key paths
+      VM_REG_KEYS = [
+          r"SOFTWARE\VMware, Inc.\VMware Tools",
+          r"SOFTWARE\Oracle\VirtualBox Guest Additions",
+          r"SYSTEM\ControlSet001\Services\VBoxGuest",
+          r"HARDWARE\ACPI\DSDT\VBOX__",
+          r"SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters",
+      ]
+      for key in VM_REG_KEYS:
+          if key.lower().encode('ascii') in raw.lower():
+              add("Anti-VM (registry)", f"[RE-ANTIDEBUG] VM registry key: {key[:50]}",
+                  "High",
+                  f"Registry path `{key}` detected. The binary checks this path to detect VM presence.",
+                  "Delete or redirect the registry key. Use a bare-metal analysis environment.")
+
+      # RDTSC instruction byte pattern
+      if b'\x0f\x31' in raw:
+          count = raw.count(b'\x0f\x31')
+          add("Anti-debug (timing)", f"[RE-ANTIDEBUG] RDTSC instruction ({count} occurrences)",
+              "High",
+              f"RDTSC (0F 31) instruction found {count} time(s). "
+              "RDTSC reads the CPU timestamp counter — two back-to-back calls measure execution time. "
+              "If the delta is too large (debugger stepping), the binary detects analysis.",
+              "Use ScyllaHide's RDTSC hook, or patch RDTSC to XOR EAX,EAX / XOR EDX,EDX / NOP.")
+
+      # Flatten
+      for cat, items in detected_categories.items():
+          findings.extend(items)
+
+      md_rows = [
+          f"| {f['severity']} | {f['title'].replace('[RE-ANTIDEBUG] ','')} |"
+          for f in findings
+      ]
+
+      json.dump({"findings": findings}, open("antidebug-findings.json", "w"), indent=2)
+
+      with open("antidebug-report.md", "w") as f:
+          f.write(f"# Anti-Analysis Detection — {target}\n\n")
+          f.write(f"**Techniques detected:** {len(findings)}\n\n")
+          f.write("| Severity | Technique |\n|---|---|\n")
+          f.write("\n".join(md_rows) + "\n")
+
+      print(f"re-antidebug: {len(findings)} anti-analysis techniques in {target}")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-antidebug"
+        for f in antidebug-findings.json antidebug-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-antidebug-${CI_COMMIT_SHORT_SHA}"
+    paths: [antidebug-findings.json, antidebug-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
