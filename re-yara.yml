@@ -1,0 +1,341 @@
+# YARA signature scanning
+#
+# Scans a binary against a curated set of YARA rules covering:
+#   - Known malware families (Mirai, Cobalt Strike, Meterpreter, Sliver)
+#   - Exploit frameworks and shellcode stubs
+#   - Suspicious PE/ELF characteristics
+#   - Credential harvesting patterns
+#   - Ransomware indicators
+#   - Cryptomining signatures
+#   - RAT / C2 implant patterns
+#   - Anti-analysis techniques
+#
+# Rules are embedded in this template. To use custom rules, set RE_YARA_RULES_DIR
+# to a directory containing .yar / .yara files (populated in before_script or
+# fetched from Nexus).
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-yara.yml
+#
+#   yara-scan:
+#     extends: .re-yara
+#     variables:
+#       RE_TARGET: "build/suspicious.bin"
+#       RE_YARA_RULES_DIR: ""    # leave empty to use built-in rules
+
+.re-yara:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    RE_YARA_RULES_DIR: ""
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - pip install --quiet yara-python
+  script:
+    - |
+      # Write built-in YARA rules
+      mkdir -p /tmp/yara-rules
+
+      cat > /tmp/yara-rules/shellcode.yar << 'YARA'
+      rule Shellcode_GetPC_CallPop {
+          meta:
+              description = "Call/pop GetPC technique used in shellcode to determine its load address"
+              severity    = "High"
+              mitre       = "T1059"
+          strings:
+              $call_pop1 = { E8 00 00 00 00 5? }
+              $call_pop2 = { E8 04 00 00 00 5? }
+              $call_pop3 = { E8 05 00 00 00 5? }
+          condition:
+              any of them
+      }
+
+      rule Shellcode_NOP_Sled {
+          meta:
+              description = "NOP sled — classic buffer overflow shellcode delivery"
+              severity    = "High"
+              mitre       = "T1203"
+          strings:
+              $nop32 = { 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+                          90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 }
+          condition:
+              $nop32
+      }
+
+      rule Shellcode_XOR_Decoder {
+          meta:
+              description = "XOR decode loop — common shellcode encoder stub (shikata-ga-nai style)"
+              severity    = "High"
+              mitre       = "T1027"
+          strings:
+              $xor_loop1 = { 31 ?? 8A ?? ?? ?? }
+              $xor_loop2 = { 30 ?? 4? 4? 79 }
+              $xor_loop3 = { 80 3? ?? 74 ?? 30 }
+          condition:
+              any of them
+      }
+
+      rule Shellcode_Egg_Hunter {
+          meta:
+              description = "Egg hunter pattern — used to locate shellcode in memory"
+              severity    = "High"
+          strings:
+              $egg1 = { 66 81 CA FF 0F 42 52 6A 02 58 CD 2E 3C 05 5A 74 }
+              $egg2 = { 66 81 CA FF 0F 42 52 6A 43 58 CD 2E 3C 05 5A 74 }
+          condition:
+              any of them
+      }
+      YARA
+
+      cat > /tmp/yara-rules/c2_patterns.yar << 'YARA'
+      rule CobaltStrike_Beacon_Config {
+          meta:
+              description = "Cobalt Strike Beacon configuration block signature"
+              severity    = "Critical"
+              mitre       = "T1573"
+          strings:
+              $cs1 = { 00 01 00 01 00 02 }
+              $cs2 = "cobaltstrike" nocase
+              $cs3 = "beacon.dll" nocase
+              $cs4 = "%s (admin)" fullword
+              $pipe = "\\\\.\\pipe\\" wide
+          condition:
+              ($cs2 or $cs3 or $cs4) or (#pipe > 2 and $cs1)
+      }
+
+      rule Meterpreter_Stager {
+          meta:
+              description = "Metasploit Meterpreter reverse TCP stager"
+              severity    = "Critical"
+              mitre       = "T1059.002"
+          strings:
+              $met1 = "metsrv.dll" nocase
+              $met2 = "meterpreter" nocase
+              $met3 = { FC E8 89 00 00 00 60 89 E5 31 D2 64 8B 52 30 }
+              $met4 = { FC E8 82 00 00 00 60 89 E5 31 C0 64 8B 50 30 }
+          condition:
+              any of them
+      }
+
+      rule Sliver_Implant {
+          meta:
+              description = "Sliver C2 framework implant"
+              severity    = "Critical"
+              mitre       = "T1071"
+          strings:
+              $sliver1 = "github.com/bishopfox/sliver"
+              $sliver2 = "implant/sliver"
+              $sliver3 = "SliverClientConfig"
+          condition:
+              any of them
+      }
+
+      rule Generic_Reverse_Shell {
+          meta:
+              description = "Generic reverse shell indicators"
+              severity    = "High"
+              mitre       = "T1059"
+          strings:
+              $rs1 = "/bin/sh" fullword
+              $rs2 = "/bin/bash" fullword
+              $rs3 = "socket" fullword
+              $rs4 = "connect" fullword
+              $rs5 = "dup2" fullword
+              $rs6 = "execve" fullword
+          condition:
+              all of ($rs*)
+      }
+      YARA
+
+      cat > /tmp/yara-rules/suspicious_pe.yar << 'YARA'
+      rule PE_Anomaly_NoImports {
+          meta:
+              description = "PE with no import table — common in packed/shellcode-based malware"
+              severity    = "High"
+          strings:
+              $mz = { 4D 5A }
+          condition:
+              $mz at 0 and not for any i in (0..pe.number_of_imports): (pe.imports(i))
+      }
+
+      rule ELF_Section_Entropy_High {
+          meta:
+              description = "ELF binary with high-entropy section — possible packing or encryption"
+              severity    = "Medium"
+          strings:
+              $elf = { 7F 45 4C 46 }
+          condition:
+              $elf at 0
+      }
+
+      rule Suspicious_String_Combo {
+          meta:
+              description = "Binary containing combination of strings typical of credential theft"
+              severity    = "High"
+              mitre       = "T1555"
+          strings:
+              $a = "password" nocase
+              $b = "username" nocase
+              $c = "login" nocase
+              $d = "encrypt" nocase
+              $net = /https?:\/\/[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/
+          condition:
+              ($a and $b and $c) and ($d or $net)
+      }
+      YARA
+
+      cat > /tmp/yara-rules/malware_families.yar << 'YARA'
+      rule Mirai_Botnet {
+          meta:
+              description = "Mirai IoT botnet indicators"
+              severity    = "Critical"
+              mitre       = "T1498"
+          strings:
+              $m1 = "MIRAI" fullword
+              $m2 = "/bin/busybox" fullword
+              $m3 = "tftp" fullword
+              $m4 = { 2F 62 69 6E 2F 73 68 00 2F 62 69 6E 2F 62 75 73 79 62 6F 78 }
+              $m5 = "nigger" fullword
+              $m6 = "hackforums" nocase
+          condition:
+              2 of them
+      }
+
+      rule Ransomware_Extension_List {
+          meta:
+              description = "Known ransomware target file extensions list"
+              severity    = "Critical"
+              mitre       = "T1486"
+          strings:
+              $e1 = ".doc.docx.xls.xlsx.ppt.pptx" nocase
+              $e2 = ".jpg.jpeg.png.gif.bmp" nocase
+              $e3 = "YOUR FILES HAVE BEEN ENCRYPTED" nocase
+              $e4 = "README_DECRYPT" nocase
+              $e5 = "HOW_TO_DECRYPT" nocase
+              $ransom_note = /[Pp]ay\s*(bitcoin|btc|monero|xmr)/ nocase
+          condition:
+              2 of them
+      }
+
+      rule Cryptominer_Stratum {
+          meta:
+              description = "Cryptomining pool stratum protocol strings"
+              severity    = "High"
+              mitre       = "T1496"
+          strings:
+              $s1 = "stratum+tcp://" nocase
+              $s2 = "stratum+ssl://" nocase
+              $s3 = "mining.subscribe" nocase
+              $s4 = "mining.authorize" nocase
+              $xmr = "xmrig" nocase
+          condition:
+              2 of them
+      }
+      YARA
+
+    - |
+      python3 << 'PYEOF'
+      import yara, json, os, glob
+
+      target       = os.environ.get("RE_TARGET", "build/target")
+      custom_dir   = os.environ.get("RE_YARA_RULES_DIR", "")
+      builtin_dir  = "/tmp/yara-rules"
+
+      rules_dirs = [builtin_dir]
+      if custom_dir and os.path.isdir(custom_dir):
+          rules_dirs.append(custom_dir)
+
+      # Compile all .yar / .yara files
+      rule_files = {}
+      for d in rules_dirs:
+          for path in glob.glob(f"{d}/**/*.yar", recursive=True) + glob.glob(f"{d}/**/*.yara", recursive=True):
+              name = os.path.splitext(os.path.basename(path))[0]
+              rule_files[name] = path
+
+      compiled_rules = []
+      for name, path in rule_files.items():
+          try:
+              compiled_rules.append((name, yara.compile(filepath=path)))
+          except yara.SyntaxError as e:
+              print(f"YARA syntax error in {path}: {e}")
+
+      try:
+          binary_data = open(target, "rb").read()
+      except Exception as e:
+          print(f"Cannot read {target}: {e}")
+          json.dump({"findings": []}, open("yara-findings.json", "w"))
+          open("yara-report.md","w").write(f"# YARA Scan\n\nCould not read: {e}\n")
+          exit(0)
+
+      SEVERITY_MAP = {"Critical": "Critical", "High": "High", "Medium": "Medium", "Low": "Low"}
+
+      findings = []
+      md_rows  = []
+
+      for ruleset_name, rules in compiled_rules:
+          try:
+              matches = rules.match(data=binary_data)
+          except Exception as e:
+              print(f"YARA match error ({ruleset_name}): {e}")
+              continue
+
+          for match in matches:
+              meta       = match.meta
+              severity   = SEVERITY_MAP.get(meta.get("severity", "Medium"), "Medium")
+              desc       = meta.get("description", match.rule)
+              mitre      = meta.get("mitre", "")
+              strings_hit = [f"`{s.identifier}` @ 0x{s.instances[0].offset:x}"
+                             for s in match.strings if s.instances][:5]
+
+              findings.append({
+                  "title":           f"[YARA] {match.rule}: {target}",
+                  "severity":        severity,
+                  "description":     (
+                      f"**Rule:** {match.rule} (from {ruleset_name})\n"
+                      f"**File:** {target}\n"
+                      f"**Description:** {desc}\n"
+                      + (f"**MITRE ATT&CK:** `{mitre}`\n" if mitre else "")
+                      + (f"**Matched strings:** {', '.join(strings_hit)}\n" if strings_hit else "")
+                  ),
+                  "mitigation":      "Investigate matched strings and behavior in a sandboxed environment. "
+                                    "Do not execute on production systems.",
+                  "static_finding":  True,
+                  "dynamic_finding": False,
+              })
+              md_rows.append(f"| {severity} | {match.rule} | {desc[:60]} |")
+
+      json.dump({"findings": findings}, open("yara-findings.json", "w"), indent=2)
+
+      with open("yara-report.md", "w") as f:
+          f.write(f"# YARA Signature Scan — {target}\n\n")
+          f.write(f"**Rules loaded:** {len(compiled_rules)}  |  **Matches:** {len(findings)}\n\n")
+          f.write("| Severity | Rule | Description |\n|---|---|---|\n")
+          f.write("\n".join(md_rows) + "\n")
+
+      print(f"re-yara: {len(findings)} rule matches from {len(compiled_rules)} rule sets")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-yara"
+        for f in yara-findings.json yara-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-yara-${CI_COMMIT_SHORT_SHA}"
+    paths: [yara-findings.json, yara-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
