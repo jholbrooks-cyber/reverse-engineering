@@ -1,0 +1,205 @@
+# Per-section entropy analysis
+#
+# Calculates Shannon entropy for each section in a PE or ELF binary.
+# High entropy (> 7.0) in code or data sections suggests:
+#   - UPX / custom packer
+#   - Encrypted payload blob
+#   - Embedded shellcode
+#   - Obfuscated strings
+#
+# Low entropy (< 1.0) in large sections suggests:
+#   - Padding / BSS
+#   - Debug builds with zeroed memory
+#
+# Entropy scoring thresholds:
+#   < 1.0   → Suspicious (zero-filled / padding)
+#   1.0–6.5 → Normal compiled code or data
+#   6.5–7.0 → Elevated — compressed data or dense code
+#   7.0–7.5 → High — likely compressed or encrypted
+#   > 7.5   → Very high — packed, encrypted, or shellcode
+#
+# Supports: ELF (via pyelftools), PE (via pefile), and raw binary (whole-file entropy).
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-entropy.yml
+#
+#   entropy-scan:
+#     extends: .re-entropy
+#     variables:
+#       RE_TARGET: "build/packed.exe"
+
+.re-entropy:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - pip install --quiet pefile pyelftools
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, math, struct
+
+      target = os.environ.get("RE_TARGET", "build/target")
+
+      def shannon_entropy(data: bytes) -> float:
+          if not data:
+              return 0.0
+          freq = [0] * 256
+          for b in data:
+              freq[b] += 1
+          n = len(data)
+          return -sum((c / n) * math.log2(c / n) for c in freq if c)
+
+      def severity(ent: float, size: int) -> str:
+          if size < 512:
+              return None  # ignore tiny sections
+          if ent > 7.5:
+              return "High"
+          if ent > 7.0:
+              return "Medium"
+          if ent < 1.0 and size > 4096:
+              return "Low"
+          return None
+
+      try:
+          raw = open(target, "rb").read()
+      except Exception as e:
+          print(f"Cannot read {target}: {e}")
+          json.dump({"findings": []}, open("entropy-findings.json", "w"))
+          open("entropy-report.md","w").write(f"# Entropy Scan\n\nCould not read: {e}\n")
+          exit(0)
+
+      sections = []
+      fmt = "unknown"
+
+      # --- PE ---
+      if raw[:2] == b'MZ':
+          try:
+              import pefile
+              pe = pefile.PE(data=raw)
+              fmt = "PE"
+              for s in pe.sections:
+                  name = s.Name.rstrip(b'\x00').decode('ascii','replace')
+                  data = s.get_data()
+                  ent  = shannon_entropy(data)
+                  sections.append({
+                      "name": name, "offset": s.PointerToRawData,
+                      "vaddr": s.VirtualAddress, "size": len(data), "entropy": ent,
+                      "chars": hex(s.Characteristics),
+                  })
+          except Exception as e:
+              print(f"pefile error: {e}")
+
+      # --- ELF ---
+      elif raw[:4] == b'\x7fELF':
+          try:
+              from elftools.elf.elffile import ELFFile
+              from io import BytesIO
+              fmt = "ELF"
+              elf = ELFFile(BytesIO(raw))
+              for s in elf.iter_sections():
+                  if s['sh_size'] == 0:
+                      continue
+                  data = s.data()
+                  ent  = shannon_entropy(data)
+                  sections.append({
+                      "name": s.name, "offset": s['sh_offset'],
+                      "vaddr": s['sh_addr'], "size": s['sh_size'], "entropy": ent,
+                      "type": s['sh_type'],
+                  })
+          except Exception as e:
+              print(f"pyelftools error: {e}")
+
+      # --- Raw binary ---
+      if not sections:
+          fmt = "raw"
+          chunk = 4096
+          for i, offset in enumerate(range(0, len(raw), chunk)):
+              block = raw[offset:offset+chunk]
+              ent   = shannon_entropy(block)
+              sections.append({
+                  "name": f"chunk_{i}", "offset": offset,
+                  "vaddr": 0, "size": len(block), "entropy": ent,
+              })
+
+      findings = []
+      md_rows  = []
+
+      overall_ent = shannon_entropy(raw)
+      md_rows.append(f"| **WHOLE FILE** | — | {len(raw):,} | **{overall_ent:.3f}** | — |")
+
+      for sec in sections:
+          ent  = sec["entropy"]
+          sev  = severity(ent, sec["size"])
+          bar  = "█" * int(ent) + "░" * (8 - int(ent))
+          md_rows.append(
+              f"| `{sec['name']}` | 0x{sec['offset']:08x} | {sec['size']:,} | {ent:.3f} [{bar}] "
+              f"| {sev or '—'} |"
+          )
+
+          if sev:
+              note = (
+                  f"Entropy {ent:.3f} > 7.5 — this section is likely packed, encrypted, or contains shellcode."
+                  if ent > 7.5 else
+                  f"Entropy {ent:.3f} > 7.0 — elevated. Compressed data or dense code; verify with dynamic analysis."
+                  if ent > 7.0 else
+                  f"Entropy {ent:.3f} < 1.0 — near-zero entropy in a {sec['size']:,}-byte section. Unusual padding or BSS anomaly."
+              )
+              findings.append({
+                  "title": f"[RE-ENTROPY] Section `{sec['name']}` entropy={ent:.3f}",
+                  "severity": sev,
+                  "description": (
+                      f"**File:** {target} ({fmt})\n"
+                      f"**Section:** `{sec['name']}`\n"
+                      f"**Offset:** 0x{sec['offset']:08x}  "
+                      f"**Size:** {sec['size']:,} bytes  "
+                      f"**Entropy:** {ent:.3f} / 8.0\n\n{note}"
+                  ),
+                  "mitigation": (
+                      "Unpack with binwalk/upx -d, then re-analyse. "
+                      "Dynamic sandbox execution may be required to inspect the decrypted payload."
+                      if ent > 7.0 else
+                      "Review whether the section is intentionally zeroed (BSS) or indicates data corruption."
+                  ),
+                  "static_finding": True,
+                  "dynamic_finding": False,
+              })
+
+      json.dump({"findings": findings}, open("entropy-findings.json", "w"), indent=2)
+
+      with open("entropy-report.md", "w") as f:
+          f.write(f"# Entropy Analysis — {target} ({fmt})\n\n")
+          f.write(f"**Overall file entropy:** {overall_ent:.3f} / 8.0  |  "
+                  f"**Sections analysed:** {len(sections)}  |  "
+                  f"**Suspicious sections:** {len(findings)}\n\n")
+          f.write("| Section | Offset | Size | Entropy | Severity |\n|---|---|---|---|---|\n")
+          f.write("\n".join(md_rows) + "\n")
+
+      print(f"re-entropy: {len(findings)} suspicious sections in {target} (format={fmt}, overall={overall_ent:.3f})")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-entropy"
+        for f in entropy-findings.json entropy-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-entropy-${CI_COMMIT_SHORT_SHA}"
+    paths: [entropy-findings.json, entropy-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
