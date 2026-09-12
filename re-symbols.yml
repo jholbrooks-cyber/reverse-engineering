@@ -1,0 +1,266 @@
+# Symbol and debug information analysis
+#
+# Extracts and analyses symbol tables, debug information, and metadata from
+# PE and ELF binaries. Debug symbols and PDB paths left in release binaries
+# reveal source code paths, developer usernames, internal project names,
+# build environments, and compilation timestamps.
+#
+# Extracted information:
+#   ELF: .symtab / .dynsym symbol names, source file references (.debug_info),
+#        build IDs, stripped vs unstripped status
+#   PE:  PDB debug path (reveals source layout), export names, rich header
+#        (compiler/linker version fingerprinting), compilation timestamp,
+#        .NET module name, internal assembly names
+#   Both: Interesting function names (backdoor, shell, cmd, crypt, inject,
+#          hook, steal, dump, keylog, rat, bot, beacon, implant, payload)
+#
+# Why this matters:
+#   - PDB paths expose source tree structure: C:\Users\dev\Projects\malware\...
+#   - Symbol names confirm binary purpose even when strings are obfuscated
+#   - Compilation timestamps help correlate samples (timezone, campaign timing)
+#   - Rich header fingerprints specific Visual Studio and SDK versions
+#   - Unstripped ELF binaries expose every internal function name
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-symbols.yml
+#
+#   symbols-scan:
+#     extends: .re-symbols
+#     variables:
+#       RE_TARGET: "build/backdoor.elf"
+
+.re-symbols:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - pip install --quiet pefile pyelftools
+    - apt-get update -qq && apt-get install -y -qq binutils 2>/dev/null || true
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, re, struct, datetime
+
+      target = os.environ.get("RE_TARGET", "build/target")
+
+      SUSPICIOUS_KEYWORDS = [
+          'backdoor','shell','cmd','inject','hook','steal','dump','keylog',
+          'rat','bot','beacon','implant','payload','exploit','rootkit','persist',
+          'priv','escalat','bypass','evad','encrypt','decrypt','xor','obfuscat',
+          'download','upload','exfil','spread','propagat','infect','dropper',
+          'loader','stager','reflective','spawn','hollow',
+      ]
+
+      try:
+          raw = open(target, "rb").read()
+      except Exception as e:
+          print(f"Cannot read {target}: {e}")
+          json.dump({"findings": []}, open("symbols-findings.json", "w"))
+          open("symbols-report.md","w").write(f"# Symbol Scan\n\nCould not read: {e}\n")
+          exit(0)
+
+      findings = []
+      md_rows  = []
+      all_symbols = []
+      fmt = "unknown"
+
+      def add(title, sev, detail, mitigation="Review in disassembler."):
+          findings.append({
+              "title":           f"[RE-SYMBOLS] {title}",
+              "severity":        sev,
+              "description":     f"**Target:** {target}\n\n{detail}",
+              "mitigation":      mitigation,
+              "static_finding":  True,
+              "dynamic_finding": False,
+          })
+          md_rows.append(f"| {sev} | {title[:80]} |")
+
+      # ─── ELF ───────────────────────────────────────────────────────────────
+      if raw[:4] == b'\x7fELF':
+          fmt = "ELF"
+          try:
+              from elftools.elf.elffile import ELFFile
+              from elftools.elf.sections import SymbolTableSection
+              from io import BytesIO
+
+              elf = ELFFile(BytesIO(raw))
+
+              # Check stripped status
+              symtab = elf.get_section_by_name('.symtab')
+              if symtab is None:
+                  add("ELF binary is stripped (no .symtab)", "Low",
+                      "The .symtab section has been removed. Symbol recovery requires either:\n"
+                      "- Dynamic symbol table (.dynsym) for exported functions\n"
+                      "- FLIRT signatures in IDA Pro\n"
+                      "- Debug info if .debug_info section present",
+                      "Use IDA FLIRT or Ghidra function identification to recover symbols.")
+              else:
+                  add("ELF binary is NOT stripped — full symbol table present", "High",
+                      f".symtab section contains {symtab.num_symbols()} symbols. "
+                      "All function and variable names are available for analysis.",
+                      "Extract symbols with: nm -an <binary>")
+
+              # Collect symbols from .symtab and .dynsym
+              for sec_name in ['.symtab', '.dynsym']:
+                  sec = elf.get_section_by_name(sec_name)
+                  if not sec or not isinstance(sec, SymbolTableSection):
+                      continue
+                  for sym in sec.iter_symbols():
+                      if sym.name and len(sym.name) > 2:
+                          all_symbols.append(sym.name)
+
+              # Build ID
+              build_id_sec = elf.get_section_by_name('.note.gnu.build-id')
+              if build_id_sec:
+                  data = build_id_sec.data()
+                  bid  = data[16:].hex() if len(data) > 16 else data.hex()
+                  add("Build ID extracted", "Low",
+                      f"GNU Build ID: `{bid}`\nUseful for correlating this binary with debug packages "
+                      "or symbol servers. Search VirusTotal / malware DBs by build ID.",
+                      "Use build ID to search for related samples or debug symbols.")
+
+              # Source file paths from .debug_str or strings
+              debug_str = elf.get_section_by_name('.debug_str')
+              if debug_str:
+                  paths = re.findall(rb'(?:/[a-zA-Z0-9_./-]{5,})', debug_str.data())
+                  if paths:
+                      path_sample = [p.decode('ascii','replace') for p in paths[:10]]
+                      add("Source paths in .debug_str", "High",
+                          "Debug string table contains source file paths:\n\n"
+                          + "\n".join(f"- `{p}`" for p in path_sample)
+                          + ("\n- ...more" if len(paths) > 10 else ""),
+                          "Source paths reveal project structure, developer usernames, and build environment.")
+          except Exception as e:
+              print(f"ELF parse error: {e}")
+
+      # ─── PE ────────────────────────────────────────────────────────────────
+      elif raw[:2] == b'MZ':
+          fmt = "PE"
+          try:
+              import pefile
+              pe = pefile.PE(data=raw)
+
+              # Compilation timestamp
+              ts = pe.FILE_HEADER.TimeDateStamp
+              if ts:
+                  try:
+                      dt = datetime.datetime.utcfromtimestamp(ts)
+                      sev = "Low"
+                      note = ""
+                      if ts == 0 or ts == 0xFFFFFFFF:
+                          sev  = "Medium"
+                          note = " (zeroed/spoofed timestamp)"
+                      add(f"PE compilation timestamp: {dt.isoformat()}Z{note}", sev,
+                          f"Raw timestamp: 0x{ts:08x} → {dt.isoformat()}Z\n"
+                          f"Timezone of compiler may be inferred if timestamp correlates with local working hours.\n"
+                          f"{note}",
+                          "Cross-reference with other samples. Spoofed timestamps (0x0 or 0xFFFFFFFF) "
+                          "indicate the author attempted to remove timing metadata.")
+                  except (OSError, OverflowError):
+                      pass
+
+              # PDB path (debug directory)
+              if hasattr(pe, 'DIRECTORY_ENTRY_DEBUG'):
+                  for dbg in pe.DIRECTORY_ENTRY_DEBUG:
+                      if hasattr(dbg, 'entry') and hasattr(dbg.entry, 'PdbFileName'):
+                          pdb = dbg.entry.PdbFileName.decode('ascii','replace').rstrip('\x00')
+                          add(f"PDB path: {pdb}", "High",
+                              f"Debug PDB path embedded in binary: `{pdb}`\n\n"
+                              "PDB paths reveal:\n"
+                              "- Source code directory structure\n"
+                              "- Developer username (C:\\Users\\**username**\\...)\n"
+                              "- Internal project/product name\n"
+                              "- CI build server paths",
+                              "The PDB path is a primary fingerprint for malware attribution. "
+                              "Search the full path on VirusTotal and threat intel platforms.")
+
+              # Rich header (compiler fingerprint)
+              if hasattr(pe, 'RICH_HEADER'):
+                  add("Rich header present — compiler fingerprint available", "Low",
+                      "The PE Rich header encodes the compiler, linker, and SDK versions used to build the binary. "
+                      "This fingerprint is consistent within a build environment and can correlate samples "
+                      "from the same actor/toolchain.",
+                      "Parse with richprint or peframe. Compare rich header hash across related samples.")
+
+              # Internal name / original filename
+              if hasattr(pe, 'FileInfo'):
+                  for fi in pe.FileInfo:
+                      if hasattr(fi, 'StringTable'):
+                          for st in fi.StringTable:
+                              for key, val in st.entries.items():
+                                  k = key.decode('latin-1','replace')
+                                  v = val.decode('latin-1','replace')
+                                  if k in ('OriginalFilename','InternalName','ProductName','CompanyName') and v.strip():
+                                      add(f"PE version info — {k}: {v}", "Medium",
+                                          f"**{k}:** `{v}`\nVersion info strings reveal original filename, "
+                                          "product name, and developer/company identity.",
+                                          "Cross-reference against known legitimate files with the same name (possible binary masquerading).")
+
+              # Export names
+              if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                  exports = [s.name.decode('ascii','replace')
+                             for s in pe.DIRECTORY_ENTRY_EXPORT.symbols if s.name]
+                  all_symbols.extend(exports)
+                  if exports:
+                      add(f"PE exports: {len(exports)} exported symbols", "Low",
+                          "Exported symbols:\n" + "\n".join(f"- `{e}`" for e in exports[:20])
+                          + (f"\n- ...and {len(exports)-20} more" if len(exports) > 20 else ""),
+                          "Exported symbols in non-DLL executables may indicate reflective loaders or plugin interfaces.")
+          except Exception as e:
+              print(f"PE parse error: {e}")
+
+      # ─── Suspicious symbol names ───────────────────────────────────────────
+      if all_symbols:
+          suspicious = [
+              sym for sym in all_symbols
+              if any(kw in sym.lower() for kw in SUSPICIOUS_KEYWORDS)
+          ]
+          if suspicious:
+              add(f"{len(suspicious)} suspicious symbol names detected", "High",
+                  "Symbol names containing keywords associated with malicious functionality:\n\n"
+                  + "\n".join(f"- `{s}`" for s in suspicious[:30])
+                  + (f"\n- ...and {len(suspicious)-30} more" if len(suspicious) > 30 else ""),
+                  "Review each flagged symbol in a disassembler. The symbol names directly indicate "
+                  "the binary's capabilities.")
+
+          add(f"Total symbols extracted: {len(all_symbols)}", "Low",
+              f"{len(all_symbols)} symbols available for analysis.\n"
+              "Sample: " + ", ".join(f"`{s}`" for s in all_symbols[:10]),
+              "Review full symbol list with: nm -an <binary> (ELF) or dumpbin /exports (PE)")
+
+      json.dump({"findings": findings}, open("symbols-findings.json", "w"), indent=2)
+
+      with open("symbols-report.md", "w") as f:
+          f.write(f"# Symbol / Debug Info Analysis — {target} ({fmt})\n\n")
+          f.write(f"**Findings:** {len(findings)}  |  **Total symbols:** {len(all_symbols)}\n\n")
+          f.write("| Severity | Finding |\n|---|---|\n")
+          f.write("\n".join(md_rows) + "\n")
+
+      print(f"re-symbols: {len(findings)} symbol findings, {len(all_symbols)} symbols extracted ({fmt})")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-symbols"
+        for f in symbols-findings.json symbols-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-symbols-${CI_COMMIT_SHORT_SHA}"
+    paths: [symbols-findings.json, symbols-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
