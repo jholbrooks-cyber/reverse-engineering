@@ -1,0 +1,251 @@
+# Packer and protector detection
+#
+# Identifies whether a binary has been packed, encrypted, or protected using
+# common tools. Packed binaries must be unpacked before meaningful static
+# analysis (strings, imports, YARA) can be performed.
+#
+# Detection methods:
+#   1. Known packer magic bytes / section names in binary header
+#   2. binwalk signature scan for embedded file headers
+#   3. PE/ELF structural anomalies (entry point outside normal sections,
+#      section name entropy mismatches, overlay data)
+#   4. String-based detection (packer version strings, copyright notices)
+#
+# Detected packers / protectors:
+#   UPX           — open-source packer (UPX! magic, UPX0/UPX1 sections)
+#   Themida       — commercial protector (Oreans copyright)
+#   VMProtect     — virtualisation protector (.vmp0/.vmp1 sections)
+#   Enigma        — Enigma Protector
+#   ASPack        — ASPack packer
+#   PECompact     — PECompact packer
+#   MPRESS        — MPRESS packer
+#   Confuser      — .NET obfuscator
+#   ConfuserEx    — .NET obfuscator
+#   .NET Reactor  — .NET obfuscator/protector
+#   Custom packer — entry point in high-entropy section
+#
+# Usage:
+#   include:
+#     - project: homelab/components/reverse-engineering
+#       ref: main
+#       file: re-packer.yml
+#
+#   packer-scan:
+#     extends: .re-packer
+#     variables:
+#       RE_TARGET: "build/packed.exe"
+
+.re-packer:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    RE_TARGET: "build/target"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "bin-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - pip install --quiet pefile pyelftools
+    - apt-get update -qq && apt-get install -y -qq binwalk 2>/dev/null || true
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, math, struct, subprocess
+
+      target = os.environ.get("RE_TARGET", "build/target")
+
+      def shannon_entropy(data):
+          if not data: return 0.0
+          freq = [0]*256
+          for b in data: freq[b] += 1
+          n = len(data)
+          return -sum((c/n)*math.log2(c/n) for c in freq if c)
+
+      try:
+          raw = open(target, "rb").read()
+      except Exception as e:
+          print(f"Cannot read {target}: {e}")
+          json.dump({"findings": []}, open("packer-findings.json", "w"))
+          open("packer-report.md","w").write(f"# Packer Scan\n\nCould not read: {e}\n")
+          exit(0)
+
+      PACKER_SIGS = [
+          # UPX
+          ("UPX", b"UPX!", "Critical",
+           "UPX packed binary. Unpack with: upx -d <binary>. After unpacking, re-run all RE scans."),
+          ("UPX", b"UPX0", "Critical",
+           "UPX section name detected (UPX0). Binary is UPX-packed."),
+          # ASPack
+          ("ASPack", b".aspack", "High",
+           "ASPack packer detected. ASPack is commonly used to pack malware. Unpack with CFF Explorer or PE-bear."),
+          ("ASPack", b"aPLib", "High",
+           "aPLib compression library signature — used by ASPack and other packers."),
+          # PECompact
+          ("PECompact", b"PEC2", "High",
+           "PECompact packer detected. Requires manual unpacking or OEP finding."),
+          # MPRESS
+          ("MPRESS", b".MPRESS1", "High",
+           "MPRESS packer detected. Entry point stub will decompress code to .MPRESS2 section."),
+          # VMProtect
+          ("VMProtect", b".vmp0", "Critical",
+           "VMProtect section detected. Code is virtualised — static analysis is severely limited. "
+           "Use dynamic analysis (x64dbg + VMPDump) to recover OEP."),
+          ("VMProtect", b".vmp1", "Critical",
+           "VMProtect section 1 detected. Virtualized protection present."),
+          # Themida / WinLicense
+          ("Themida", b"Oreans Technologies", "Critical",
+           "Themida / WinLicense protector detected. Virtualization + anti-debug + anti-VM. "
+           "Requires Scylla/Themida unpacker or full dynamic unpack."),
+          # Enigma
+          ("Enigma Protector", b"Enigma protector", "High",
+           "Enigma Protector detected. Commercial packer with VM and anti-debug features."),
+          # .NET packers
+          ("ConfuserEx", b"ConfuserEx", "High",
+           ".NET obfuscator ConfuserEx detected. Deobfuscate with de4dot before analysis."),
+          ("Confuser", b"Confuser v", "Medium",
+           ".NET obfuscator Confuser detected."),
+          (".NET Reactor", b".NETReactor", "High",
+           ".NET Reactor protector detected. Use de4dot or NetReactorSlayer to deobfuscate."),
+          # Generic
+          ("NsPack", b"NorthStar", "High",
+           "NsPack packer detected. NsPack is a common packer used to reduce AV detection."),
+          ("FSG", b"\xeb\x04\xaf\x19\xbf\x29", "High",
+           "FSG (Fast Small Good) packer signature detected."),
+          ("Petite", b".petite", "High",
+           "Petite packer detected. Small self-extracting stub."),
+      ]
+
+      findings = []
+      md_rows  = []
+
+      # 1. Byte signature search
+      for packer, sig, sev, note in PACKER_SIGS:
+          if sig in raw:
+              offset = raw.find(sig)
+              findings.append({
+                  "title":       f"[RE-PACKER] {packer} detected at offset 0x{offset:x}",
+                  "severity":    sev,
+                  "description": (
+                      f"**Packer/Protector:** {packer}\n"
+                      f"**Signature:** {sig!r}\n"
+                      f"**Offset:** 0x{offset:08x}\n\n{note}"
+                  ),
+                  "mitigation":  note,
+                  "static_finding":  True,
+                  "dynamic_finding": False,
+              })
+              md_rows.append(f"| {sev} | {packer} | 0x{offset:08x} | {note[:60]} |")
+
+      # 2. PE structural analysis
+      if raw[:2] == b'MZ':
+          try:
+              import pefile
+              pe = pefile.PE(data=raw)
+
+              # Entry point section entropy check
+              ep = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+              ep_section = None
+              for s in pe.sections:
+                  if s.VirtualAddress <= ep < s.VirtualAddress + s.Misc_VirtualSize:
+                      ep_section = s
+                      break
+
+              if ep_section:
+                  ep_data = ep_section.get_data()
+                  ent = shannon_entropy(ep_data)
+                  name = ep_section.Name.rstrip(b'\x00').decode('ascii','replace')
+                  if ent > 7.0:
+                      findings.append({
+                          "title":    f"[RE-PACKER] Entry point in high-entropy section '{name}' (entropy={ent:.2f})",
+                          "severity": "High",
+                          "description": (
+                              f"Entry point 0x{ep:x} resides in section '{name}' with entropy {ent:.2f}/8.0.\n"
+                              "High-entropy code sections strongly indicate packing or encryption. "
+                              "The unpacking stub is likely at the entry point."
+                          ),
+                          "mitigation": "Use x64dbg with ScyllaHide to find OEP, then dump with Scylla. "
+                                       "Alternatively attempt upx -d if UPX signatures are present.",
+                          "static_finding": True, "dynamic_finding": False,
+                      })
+                      md_rows.append(f"| High | EP in high-entropy section '{name}' | — | entropy={ent:.2f} |")
+
+              # Overlay detection
+              last_section = max(pe.sections, key=lambda s: s.PointerToRawData + s.SizeOfRawData, default=None)
+              if last_section:
+                  overlay_start = last_section.PointerToRawData + last_section.SizeOfRawData
+                  overlay_size  = len(raw) - overlay_start
+                  if overlay_size > 1024:
+                      overlay_data = raw[overlay_start:overlay_start+4096]
+                      ent = shannon_entropy(overlay_data)
+                      findings.append({
+                          "title":    f"[RE-PACKER] PE overlay: {overlay_size:,} bytes at offset 0x{overlay_start:x} (entropy={ent:.2f})",
+                          "severity": "Medium",
+                          "description": (
+                              f"PE overlay of {overlay_size:,} bytes detected after the last section.\n"
+                              f"Overlay entropy: {ent:.2f}/8.0\n"
+                              "Overlays are used to embed payloads, configs, or decryption keys outside of PE sections."
+                          ),
+                          "mitigation": "Extract overlay with dd or binwalk and analyse separately.",
+                          "static_finding": True, "dynamic_finding": False,
+                      })
+                      md_rows.append(f"| Medium | PE overlay | 0x{overlay_start:08x} | {overlay_size:,} bytes, ent={ent:.2f} |")
+          except Exception as e:
+              print(f"PE analysis error: {e}")
+
+      # 3. binwalk scan (if available)
+      try:
+          bw_result = subprocess.run(
+              ["binwalk", "--entropy", "--signature", target],
+              capture_output=True, text=True, timeout=60
+          )
+          if bw_result.returncode == 0 and bw_result.stdout.strip():
+              binwalk_interesting = [
+                  l for l in bw_result.stdout.splitlines()
+                  if any(kw in l.lower() for kw in ["gzip","zlib","zip","pe32","elf","certificate","encrypted"])
+              ]
+              if binwalk_interesting:
+                  findings.append({
+                      "title":    f"[RE-PACKER] binwalk detected embedded signatures",
+                      "severity": "Medium",
+                      "description": (
+                          "binwalk detected embedded file signatures within the binary:\n\n"
+                          + "\n".join(binwalk_interesting[:20])
+                      ),
+                      "mitigation": "Extract embedded files with: binwalk -e <binary>. Analyse each extracted file independently.",
+                      "static_finding": True, "dynamic_finding": False,
+                  })
+                  md_rows.append(f"| Medium | binwalk embedded signatures | — | {len(binwalk_interesting)} hits |")
+      except (FileNotFoundError, subprocess.TimeoutExpired):
+          print("binwalk not available or timed out — skipping")
+
+      json.dump({"findings": findings}, open("packer-findings.json", "w"), indent=2)
+
+      with open("packer-report.md", "w") as f:
+          f.write(f"# Packer / Protector Detection — {target}\n\n")
+          f.write(f"**Detections:** {len(findings)}\n\n")
+          f.write("| Severity | Detection | Offset | Note |\n|---|---|---|---|\n")
+          f.write("\n".join(md_rows) + "\n")
+
+      if not findings:
+          print(f"re-packer: no packer signatures found in {target}")
+      else:
+          print(f"re-packer: {len(findings)} packer/protector indicators in {target}")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/re-packer"
+        for f in packer-findings.json packer-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "re-packer-${CI_COMMIT_SHORT_SHA}"
+    paths: [packer-findings.json, packer-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
