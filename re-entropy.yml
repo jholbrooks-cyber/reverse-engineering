@@ -118,15 +118,26 @@
 
       # --- Raw binary ---
       if not sections:
-          fmt = "raw"
-          chunk = 4096
-          for i, offset in enumerate(range(0, len(raw), chunk)):
-              block = raw[offset:offset+chunk]
-              ent   = shannon_entropy(block)
+          # ZIP/JAR/APK/docx — every chunk is near-max entropy by design;
+          # scanning per-chunk produces thousands of meaningless findings.
+          if raw[:4] == b'PK\x03\x04' or raw[:4] == b'PK\x05\x06':
+              fmt = "ZIP/JAR"
+              ent = shannon_entropy(raw)
               sections.append({
-                  "name": f"chunk_{i}", "offset": offset,
-                  "vaddr": 0, "size": len(block), "entropy": ent,
+                  "name": "whole-archive", "offset": 0,
+                  "vaddr": 0, "size": len(raw), "entropy": ent,
+                  "_skip_finding": True,
               })
+          else:
+              fmt = "raw"
+              chunk = 4096
+              for i, offset in enumerate(range(0, len(raw), chunk)):
+                  block = raw[offset:offset+chunk]
+                  ent   = shannon_entropy(block)
+                  sections.append({
+                      "name": f"chunk_{i}", "offset": offset,
+                      "vaddr": 0, "size": len(block), "entropy": ent,
+                  })
 
       findings = []
       md_rows  = []
@@ -134,7 +145,34 @@
       overall_ent = shannon_entropy(raw)
       md_rows.append(f"| **WHOLE FILE** | — | {len(raw):,} | **{overall_ent:.3f}** | — |")
 
+      zip_jar = fmt == "ZIP/JAR"
+
+      if zip_jar:
+          ent = sections[0]["entropy"]
+          findings.append({
+              "title": f"[RE-ENTROPY] ZIP/JAR archive — per-chunk analysis skipped",
+              "severity": "Info",
+              "description": (
+                  f"**File:** {target} (ZIP/JAR)\n"
+                  f"**Overall entropy:** {ent:.3f} / 8.0\n\n"
+                  "All chunks in a compressed archive have near-maximum entropy by design. "
+                  "Per-chunk scanning produces only noise. "
+                  "Re-run against the extracted native ELF/PE binaries for meaningful results."
+              ),
+              "mitigation": "Extract with: unzip <file> -d extracted/, then re-scan each .class/.so/.dll.",
+              "static_finding": True,
+              "dynamic_finding": False,
+          })
+
       for sec in sections:
+          if sec.get("_skip_finding"):
+              bar = "█" * int(sec["entropy"]) + "░" * (8 - int(sec["entropy"]))
+              md_rows.append(
+                  f"| `{sec['name']}` | 0x{sec['offset']:08x} | {sec['size']:,} | {sec['entropy']:.3f} [{bar}] "
+                  f"| ZIP/JAR (skipped) |"
+              )
+              continue
+
           ent  = sec["entropy"]
           sev  = severity(ent, sec["size"])
           bar  = "█" * int(ent) + "░" * (8 - int(ent))
