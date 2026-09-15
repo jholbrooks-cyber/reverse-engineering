@@ -139,19 +139,19 @@
                        else "Custom UA may be used to identify implant traffic."))
 
       # Common C2 URI patterns (Metasploit, Cobalt Strike defaults)
-      C2_PATHS = {
-          r'/[A-Za-z0-9]{4,16}\.php\?[A-Za-z0-9]+=': "Cobalt Strike PHP stager pattern",
-          r'/s/[0-9a-f]{16,32}':                     "Cobalt Strike staged URI pattern",
-          r'/updates/[0-9a-f-]{8,}':                 "Common C2 update path",
-          r'/_/[A-Za-z0-9+/=]{16,}':                 "Base64 URI — encoded C2 channel",
-          r'/MsCRLF':                                 "Metasploit macro stager path",
-          r'/payload\.exe':                           "Generic payload download path",
-          r'/image\.[0-9a-f]{8}\.png':               "Beacon config disguised as image",
-      }
-      for pattern, desc in C2_PATHS.items():
-          if re.search(pattern, text):
-              dedup_add("C2 URI Pattern", pattern, "Critical",
-                        f"Pattern matched: `{pattern}`\n{desc}")
+      C2_PATHS = [
+          (re.compile(r'/[A-Za-z0-9]{4,16}\.php\?[A-Za-z0-9]+='), "Cobalt Strike PHP stager pattern"),
+          (re.compile(r'/s/[0-9a-f]{16,32}'),                      "Cobalt Strike staged URI pattern"),
+          (re.compile(r'/updates/[0-9a-f-]{8,}'),                  "Common C2 update path"),
+          (re.compile(r'/_/[A-Za-z0-9+/=]{16,}'),                  "Base64 URI — encoded C2 channel"),
+          (re.compile(r'/MsCRLF'),                                  "Metasploit macro stager path"),
+          (re.compile(r'/payload\.exe'),                            "Generic payload download path"),
+          (re.compile(r'/image\.[0-9a-f]{8}\.png'),                "Beacon config disguised as image"),
+      ]
+      for pattern_re, desc in C2_PATHS:
+          if pattern_re.search(text):
+              dedup_add("C2 URI Pattern", pattern_re.pattern, "Critical",
+                        f"Pattern matched: `{pattern_re.pattern}`\n{desc}")
 
       # Email
       email_re = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
