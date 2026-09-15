@@ -155,14 +155,17 @@
               md_rows.append(f"| {sig['severity']} | {name} | 0x{offset:08x} |")
 
       # Scan for high-entropy regions (potential hardcoded keys/shellcode)
-      block_size = 32
-      key_count = 0
-      for i in range(0, len(data) - block_size, 4):
+      # Use 256-byte blocks with 64-byte stride; break after 5 findings to avoid
+      # scanning entire compressed/packed files (e.g. JARs) which are high-entropy throughout
+      block_size = 256
+      stride     = 64
+      key_count  = 0
+      for i in range(0, len(data) - block_size, stride):
           block = data[i:i+block_size]
           ent = byte_entropy(block)
           if ent > 7.5:
               key_count += 1
-              if key_count <= 5:  # cap findings
+              if key_count <= 5:
                   findings.append({
                       "title":       f"[RE-CRYPTO] High-entropy region at 0x{i:x} (entropy={ent:.2f})",
                       "severity":    "Medium",
@@ -179,12 +182,14 @@
                       "dynamic_finding": False,
                   })
                   md_rows.append(f"| Medium | High-entropy region | 0x{i:08x} (ent={ent:.2f}) |")
+              else:
+                  break  # enough samples found; stop scanning
 
       if key_count > 5:
           findings.append({
-              "title": f"[RE-CRYPTO] {key_count} high-entropy regions (showing first 5)",
+              "title": f"[RE-CRYPTO] {key_count}+ high-entropy regions (showing first 5)",
               "severity": "Medium",
-              "description": f"{key_count} regions with entropy > 7.5 detected. "
+              "description": f"At least {key_count} regions with entropy > 7.5 detected. "
                             "High volume suggests packed/encrypted binary or large embedded payload.",
               "mitigation": "Unpack with binwalk or dynamic analysis before further RE.",
               "static_finding": True, "dynamic_finding": False,

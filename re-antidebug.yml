@@ -46,11 +46,9 @@
 
       try:
           raw = open(target, "rb").read()
-          # Also get printable strings for string-based detection
-          strings_set = set(
-              s.decode('ascii','replace')
-              for s in re.findall(rb'[\x20-\x7e]{5,}', raw)
-          )
+          raw_str       = raw.decode('latin-1', errors='replace')
+          raw_str_lower = raw_str.lower()
+          raw_lower     = raw.lower()          # bytes, for registry key search
       except Exception as e:
           print(f"Cannot read {target}: {e}")
           json.dump({"findings": []}, open("antidebug-findings.json", "w"))
@@ -110,7 +108,7 @@
       }
 
       for api, (sev, cat, detail) in ANTIDEBUG_APIS.items():
-          if api in raw.decode('latin-1', errors='replace') or any(api in s for s in strings_set):
+          if api in raw_str:
               add(cat, f"[RE-ANTIDEBUG] {api}", sev, detail,
                   "Use ScyllaHide plugin (x64dbg/x32dbg) to automatically bypass common anti-debug techniques. "
                   "For targeted bypass, hook the function and patch the return value.")
@@ -141,8 +139,7 @@
       }
 
       for vm_str, (sev, cat, detail) in VM_STRINGS.items():
-          lower_raw = raw.decode('latin-1','replace').lower()
-          if vm_str.lower() in lower_raw:
+          if vm_str.lower() in raw_str_lower:
               add(cat, f"[RE-ANTIDEBUG] VM/sandbox string: '{vm_str}'", sev, detail,
                   "Patch or NOP the string comparison. In a VM: rename SVGA driver files, "
                   "modify BIOS strings, use VMware hardening scripts.")
@@ -156,7 +153,7 @@
           r"SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters",
       ]
       for key in VM_REG_KEYS:
-          if key.lower().encode('ascii') in raw.lower():
+          if key.lower().encode('ascii') in raw_lower:
               add("Anti-VM (registry)", f"[RE-ANTIDEBUG] VM registry key: {key[:50]}",
                   "High",
                   f"Registry path `{key}` detected. The binary checks this path to detect VM presence.",
