@@ -34,15 +34,13 @@
 
 .re-symbols:
   stage: test
-  image: python:3.12-slim
+  image: harbor.home.lan/homelab/re-tools:latest
   variables:
     RE_TARGET: "build/target"
     NEXUS_REPORT_UPLOAD: "true"
     NEXUS_BIN_REPORTS_REPO: "bin-reports"
     NEXUS_URL: "https://nexus.home.lan"
   before_script:
-    - pip install --quiet pefile pyelftools
-    - apt-get update -qq && apt-get install -y -qq binutils 2>/dev/null || true
   script:
     - |
       python3 << 'PYEOF'

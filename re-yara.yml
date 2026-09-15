@@ -28,7 +28,7 @@
 
 .re-yara:
   stage: test
-  image: python:3.12-slim
+  image: harbor.home.lan/homelab/re-tools:latest
   variables:
     RE_TARGET: "build/target"
     RE_YARA_RULES_DIR: ""
